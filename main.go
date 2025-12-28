@@ -25,9 +25,20 @@ type User struct {
 	ID          string    `json:"id"`
 	Username    string    `json:"username"`
 	ConnID      string    `json:"conn_id"`
+	CurrentRoom string    `json:"current_room"` // ห้องปัจจุบัน
 	JoinedAt    time.Time `json:"joined_at"`
 	LastActive  time.Time `json:"last_active"`
 	IsAuthenticated bool  `json:"is_authenticated"`
+}
+
+// Room represents a chat room
+type Room struct {
+	Name        string            `json:"name"`
+	Users       map[string]*User  `json:"users"`        // username -> User
+	CreatedAt   time.Time         `json:"created_at"`
+	CreatedBy   string            `json:"created_by"`
+	MaxUsers    int               `json:"max_users"`
+	IsActive    bool              `json:"is_active"`
 }
 
 // Message represents a message to be broadcasted
@@ -43,9 +54,166 @@ type Message struct {
 type BroadcastMessage struct {
 	Message   *Message
 	ExcludeID string // ID ของ connection ที่ไม่ต้องการส่งไป
+	RoomName  string // ชื่อห้องที่จะส่งข้อความ (ถ้าว่างจะส่งให้ทุกคน)
 }
 
-// UserManager manages user authentication and sessions
+// RoomManager manages chat rooms
+type RoomManager struct {
+	rooms map[string]*Room
+	mutex sync.RWMutex
+}
+
+// NewRoomManager creates a new room manager
+func NewRoomManager() *RoomManager {
+	rm := &RoomManager{
+		rooms: make(map[string]*Room),
+	}
+	
+	// สร้างห้อง default
+	defaultRoom := &Room{
+		Name:      "general",
+		Users:     make(map[string]*User),
+		CreatedAt: time.Now(),
+		CreatedBy: "System",
+		MaxUsers:  100,
+		IsActive:  true,
+	}
+	rm.rooms["general"] = defaultRoom
+	
+	log.Printf("🏠 Default room 'general' created")
+	return rm
+}
+
+// CreateRoom creates a new room
+func (rm *RoomManager) CreateRoom(name, creatorUsername string) (*Room, error) {
+	rm.mutex.Lock()
+	defer rm.mutex.Unlock()
+
+	// ตรวจสอบว่าห้องมีอยู่แล้วหรือไม่
+	if _, exists := rm.rooms[name]; exists {
+		return nil, fmt.Errorf("room '%s' already exists", name)
+	}
+
+	// สร้างห้องใหม่
+	room := &Room{
+		Name:      name,
+		Users:     make(map[string]*User),
+		CreatedAt: time.Now(),
+		CreatedBy: creatorUsername,
+		MaxUsers:  50, // จำกัด 50 คนต่อห้อง
+		IsActive:  true,
+	}
+
+	rm.rooms[name] = room
+	log.Printf("🏠 Room '%s' created by %s", name, creatorUsername)
+	return room, nil
+}
+
+// JoinRoom adds a user to a room
+func (rm *RoomManager) JoinRoom(user *User, roomName string) error {
+	rm.mutex.Lock()
+	defer rm.mutex.Unlock()
+
+	// ตรวจสอบว่าห้องมีอยู่หรือไม่
+	room, exists := rm.rooms[roomName]
+	if !exists {
+		return fmt.Errorf("room '%s' does not exist", roomName)
+	}
+
+	// ตรวจสอบว่าห้องเต็มหรือไม่
+	if len(room.Users) >= room.MaxUsers {
+		return fmt.Errorf("room '%s' is full", roomName)
+	}
+
+	// ออกจากห้องเก่า (ถ้ามี)
+	if user.CurrentRoom != "" {
+		rm.leaveRoomInternal(user, user.CurrentRoom)
+	}
+
+	// เข้าห้องใหม่
+	room.Users[user.Username] = user
+	user.CurrentRoom = roomName
+
+	log.Printf("🚪 User %s joined room '%s' (%d/%d users)", user.Username, roomName, len(room.Users), room.MaxUsers)
+	return nil
+}
+
+// LeaveRoom removes a user from a room
+func (rm *RoomManager) LeaveRoom(user *User, roomName string) error {
+	rm.mutex.Lock()
+	defer rm.mutex.Unlock()
+	return rm.leaveRoomInternal(user, roomName)
+}
+
+// leaveRoomInternal removes a user from a room (internal, assumes lock is held)
+func (rm *RoomManager) leaveRoomInternal(user *User, roomName string) error {
+	room, exists := rm.rooms[roomName]
+	if !exists {
+		return fmt.Errorf("room '%s' does not exist", roomName)
+	}
+
+	// ลบผู้ใช้จากห้อง
+	delete(room.Users, user.Username)
+	if user.CurrentRoom == roomName {
+		user.CurrentRoom = ""
+	}
+
+	log.Printf("🚪 User %s left room '%s' (%d/%d users)", user.Username, roomName, len(room.Users), room.MaxUsers)
+	return nil
+}
+
+// GetRoom returns a room by name
+func (rm *RoomManager) GetRoom(name string) (*Room, bool) {
+	rm.mutex.RLock()
+	defer rm.mutex.RUnlock()
+	room, exists := rm.rooms[name]
+	return room, exists
+}
+
+// GetRooms returns all active rooms
+func (rm *RoomManager) GetRooms() []*Room {
+	rm.mutex.RLock()
+	defer rm.mutex.RUnlock()
+	
+	rooms := make([]*Room, 0, len(rm.rooms))
+	for _, room := range rm.rooms {
+		if room.IsActive {
+			rooms = append(rooms, room)
+		}
+	}
+	return rooms
+}
+
+// GetUsersInRoom returns all users in a specific room
+func (rm *RoomManager) GetUsersInRoom(roomName string) []*User {
+	rm.mutex.RLock()
+	defer rm.mutex.RUnlock()
+	
+	room, exists := rm.rooms[roomName]
+	if !exists {
+		return []*User{}
+	}
+	
+	users := make([]*User, 0, len(room.Users))
+	for _, user := range room.Users {
+		users = append(users, user)
+	}
+	return users
+}
+
+// GetRoomCount returns the number of active rooms
+func (rm *RoomManager) GetRoomCount() int {
+	rm.mutex.RLock()
+	defer rm.mutex.RUnlock()
+	
+	count := 0
+	for _, room := range rm.rooms {
+		if room.IsActive {
+			count++
+		}
+	}
+	return count
+}
 type UserManager struct {
 	users       map[string]*User  // connID -> User
 	usersByName map[string]*User  // username -> User
@@ -244,6 +412,11 @@ func (cm *ConnectionManager) unregisterConnection(conn *Connection) {
 				ExcludeID: "", // ส่งให้ทุกคน
 			})
 
+			// ออกจากห้องปัจจุบัน
+			if conn.User.CurrentRoom != "" {
+				roomManager.LeaveRoom(conn.User, conn.User.CurrentRoom)
+			}
+
 			// ลบ user จาก user manager
 			userManager.UnregisterUser(conn.ID)
 		}
@@ -261,6 +434,7 @@ func (cm *ConnectionManager) broadcastMessage(broadcastMsg *BroadcastMessage) {
 
 	message := broadcastMsg.Message
 	excludeID := broadcastMsg.ExcludeID
+	roomName := broadcastMsg.RoomName
 	sentCount := 0
 
 	// สร้างข้อความที่จะส่ง
@@ -277,6 +451,13 @@ func (cm *ConnectionManager) broadcastMessage(broadcastMsg *BroadcastMessage) {
 			continue
 		}
 
+		// ตรวจสอบว่า connection มี user และอยู่ในห้องที่ถูกต้องหรือไม่
+		if roomName != "" && conn.User != nil {
+			if conn.User.CurrentRoom != roomName {
+				continue // ไม่อยู่ในห้องเดียวกัน ข้าม
+			}
+		}
+
 		select {
 		case conn.Send <- []byte(formattedMessage):
 			sentCount++
@@ -288,7 +469,11 @@ func (cm *ConnectionManager) broadcastMessage(broadcastMsg *BroadcastMessage) {
 		}
 	}
 
-	log.Printf("📡 Broadcasted message to %d connections (excluded: %s)", sentCount, excludeID)
+	if roomName != "" {
+		log.Printf("📡 Broadcasted message to %d connections in room '%s' (excluded: %s)", sentCount, roomName, excludeID)
+	} else {
+		log.Printf("📡 Broadcasted message to %d connections (excluded: %s)", sentCount, excludeID)
+	}
 }
 
 // AddConnection adds a new connection to the manager
@@ -320,9 +505,15 @@ func (cm *ConnectionManager) RemoveConnection(connID string) {
 
 // BroadcastMessage broadcasts a message to all connections except sender
 func (cm *ConnectionManager) BroadcastMessage(message *Message, excludeID string) {
+	cm.BroadcastToRoom(message, excludeID, "")
+}
+
+// BroadcastToRoom broadcasts a message to connections in a specific room
+func (cm *ConnectionManager) BroadcastToRoom(message *Message, excludeID, roomName string) {
 	broadcastMsg := &BroadcastMessage{
 		Message:   message,
 		ExcludeID: excludeID,
+		RoomName:  roomName,
 	}
 
 	select {
@@ -370,9 +561,10 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-// Global connection manager and user manager
+// Global connection manager, user manager, and room manager
 var connectionManager *ConnectionManager
 var userManager *UserManager
+var roomManager *RoomManager
 
 // handleWebSocket จัดการ WebSocket connections
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -449,19 +641,25 @@ func handleRead(conn *websocket.Conn, connID, clientAddr string) {
 			// เก็บ user ใน connection
 			connection.User = user
 
+			// เข้าห้อง default อัตโนมัติ
+			err = roomManager.JoinRoom(user, "general")
+			if err != nil {
+				log.Printf("❌ Failed to join default room: %v", err)
+			}
+
 			// ส่งข้อความต้อนรับ
-			welcomeMsg := fmt.Sprintf("🎉 ยินดีต้อนรับ %s! คุณสามารถเริ่มแชทได้แล้ว", username)
+			welcomeMsg := fmt.Sprintf("🎉 ยินดีต้อนรับ %s! คุณอยู่ในห้อง 'general' แล้ว", username)
 			sendSystemMessage(connection, welcomeMsg)
 
-			// แจ้งให้คนอื่นรู้ว่ามีคนเข้ามา
+			// แจ้งให้คนในห้องเดียวกันรู้ว่ามีคนเข้ามา
 			joinMsg := &Message{
 				Type:      "user_joined",
-				Content:   fmt.Sprintf("👋 %s เข้าร่วมแชทแล้ว", username),
+				Content:   fmt.Sprintf("👋 %s เข้าร่วมห้อง 'general' แล้ว", username),
 				Sender:    "System",
 				Username:  "System",
 				Timestamp: time.Now(),
 			}
-			connectionManager.BroadcastMessage(joinMsg, connID)
+			connectionManager.BroadcastToRoom(joinMsg, connID, "general")
 
 		} else {
 			// User authenticated แล้ว - ประมวลผลข้อความปกติ
@@ -476,8 +674,8 @@ func handleRead(conn *websocket.Conn, connID, clientAddr string) {
 				Timestamp: time.Now(),
 			}
 
-			// Broadcast ข้อความไปยัง clients อื่น (ไม่รวมผู้ส่ง)
-			connectionManager.BroadcastMessage(message, connID)
+			// Broadcast ข้อความไปยัง clients ในห้องเดียวกัน (ไม่รวมผู้ส่ง)
+			connectionManager.BroadcastToRoom(message, connID, connection.User.CurrentRoom)
 		}
 	}
 }
@@ -546,6 +744,7 @@ func main() {
 	// สร้าง managers
 	connectionManager = NewConnectionManager()
 	userManager = NewUserManager()
+	roomManager = NewRoomManager()
 
 	// เริ่ม connection manager ใน goroutine
 	go connectionManager.Run()
@@ -563,6 +762,7 @@ func main() {
 	log.Printf("🌐 Test page: http://localhost%s", port)
 	log.Printf("👥 Connection Manager: Ready")
 	log.Printf("🔐 User Manager: Ready")
+	log.Printf("🏠 Room Manager: Ready")
 
 	err := http.ListenAndServe(port, nil)
 	if err != nil {

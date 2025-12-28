@@ -38,6 +38,7 @@ type CommandService interface {
 	RegisterCommand(cmd *Command)
 	ExecuteCommand(conn Connection, message string) error
 	GetCommands() map[string]*Command
+	SetMessageRepository(repo MessageRepository)
 }
 
 // MessageService handles message broadcasting
@@ -218,6 +219,17 @@ type commandService struct {
 	config        *config.ServerConfig
 	validator     *security.InputValidator
 	configManager *config.ConfigManager
+	messageRepo   MessageRepository // Add message repository
+}
+
+// MessageRepository interface for message persistence
+type MessageRepository interface {
+	SaveMessage(message *Message) error
+	GetMessageHistory(roomName string, limit int) ([]*Message, error)
+	GetRecentMessages(limit int) ([]*Message, error)
+	GetUserMessageHistory(username string, limit int) ([]*Message, error)
+	GetMessageCount(roomName string) (int64, error)
+	SearchMessages(query string, roomName string, limit int) ([]*Message, error)
 }
 
 // NewCommandService creates a new command service
@@ -232,12 +244,18 @@ func NewCommandService(userService UserService, roomService RoomService, msgServ
 		config:        cfg,
 		validator:     security.NewInputValidator(cfg),
 		configManager: configManager,
+		messageRepo:   nil, // Will be set later if MongoDB is enabled
 	}
 
 	// ลงทะเบียนคำสั่งพื้นฐาน
 	cs.registerBuiltinCommands()
 
 	return cs
+}
+
+// SetMessageRepository sets the message repository for persistence
+func (s *commandService) SetMessageRepository(repo MessageRepository) {
+	s.messageRepo = repo
 }
 
 // RegisterCommand registers a new command
@@ -366,6 +384,27 @@ func (s *commandService) registerBuiltinCommands() {
 		Description: "แสดงหรือแก้ไข configuration",
 		Usage:       "/config [show|set <key> <value>]",
 		Handler:     s.handleConfig,
+	})
+
+	s.RegisterCommand(&Command{
+		Name:        "history",
+		Description: "แสดงประวัติข้อความในห้องปัจจุบัน",
+		Usage:       "/history [limit]",
+		Handler:     s.handleHistory,
+	})
+
+	s.RegisterCommand(&Command{
+		Name:        "search",
+		Description: "ค้นหาข้อความในห้องปัจจุบัน",
+		Usage:       "/search <query> [limit]",
+		Handler:     s.handleSearch,
+	})
+
+	s.RegisterCommand(&Command{
+		Name:        "myhistory",
+		Description: "แสดงประวัติข้อความของคุณ",
+		Usage:       "/myhistory [limit]",
+		Handler:     s.handleMyHistory,
 	})
 }
 
@@ -798,4 +837,134 @@ func (s *commandService) handleConfigSet(conn Connection, key, value string) err
 	}
 
 	return conn.SendMessage([]byte(fmt.Sprintf("✅ Updated %s = %s", key, value)))
+}
+
+// handleHistory shows message history for current room
+func (s *commandService) handleHistory(conn Connection, args []string) error {
+	if s.messageRepo == nil {
+		return conn.SendMessage([]byte("❌ Message history ไม่พร้อมใช้งาน (ต้องเปิดใช้ MongoDB)"))
+	}
+
+	user, hasUser := getUserFromConnection(conn)
+	if !hasUser {
+		return conn.SendMessage([]byte("❌ ผู้ใช้ไม่ได้รับการยืนยันตัวตน"))
+	}
+
+	if user.CurrentRoom == "" {
+		return conn.SendMessage([]byte("❌ คุณไม่ได้อยู่ในห้องใดๆ"))
+	}
+
+	// Parse limit
+	limit := 10 // default
+	if len(args) > 0 {
+		if val, err := strconv.Atoi(args[0]); err == nil && val > 0 && val <= 100 {
+			limit = val
+		}
+	}
+
+	messages, err := s.messageRepo.GetMessageHistory(user.CurrentRoom, limit)
+	if err != nil {
+		return conn.SendMessage([]byte(fmt.Sprintf("❌ ไม่สามารถดึงประวัติข้อความได้: %v", err)))
+	}
+
+	if len(messages) == 0 {
+		return conn.SendMessage([]byte(fmt.Sprintf("📭 ไม่มีประวัติข้อความในห้อง '%s'", user.CurrentRoom)))
+	}
+
+	historyText := fmt.Sprintf("📜 ประวัติข้อความในห้อง '%s' (%d ข้อความล่าสุด):\n", user.CurrentRoom, len(messages))
+	historyText += "================================\n"
+
+	for _, msg := range messages {
+		timestamp := msg.Timestamp.Format("15:04:05")
+		historyText += fmt.Sprintf("[%s] %s: %s\n", timestamp, msg.Username, msg.Content)
+	}
+
+	return conn.SendMessage([]byte(historyText))
+}
+
+// handleSearch searches for messages in current room
+func (s *commandService) handleSearch(conn Connection, args []string) error {
+	if s.messageRepo == nil {
+		return conn.SendMessage([]byte("❌ Message search ไม่พร้อมใช้งาน (ต้องเปิดใช้ MongoDB)"))
+	}
+
+	if len(args) == 0 {
+		return conn.SendMessage([]byte("❌ กรุณาระบุคำค้นหา: /search <query> [limit]"))
+	}
+
+	user, hasUser := getUserFromConnection(conn)
+	if !hasUser {
+		return conn.SendMessage([]byte("❌ ผู้ใช้ไม่ได้รับการยืนยันตัวตน"))
+	}
+
+	if user.CurrentRoom == "" {
+		return conn.SendMessage([]byte("❌ คุณไม่ได้อยู่ในห้องใดๆ"))
+	}
+
+	query := args[0]
+	limit := 20 // default
+
+	if len(args) > 1 {
+		if val, err := strconv.Atoi(args[1]); err == nil && val > 0 && val <= 100 {
+			limit = val
+		}
+	}
+
+	messages, err := s.messageRepo.SearchMessages(query, user.CurrentRoom, limit)
+	if err != nil {
+		return conn.SendMessage([]byte(fmt.Sprintf("❌ ไม่สามารถค้นหาข้อความได้: %v", err)))
+	}
+
+	if len(messages) == 0 {
+		return conn.SendMessage([]byte(fmt.Sprintf("🔍 ไม่พบข้อความที่มี '%s' ในห้อง '%s'", query, user.CurrentRoom)))
+	}
+
+	searchText := fmt.Sprintf("🔍 ผลการค้นหา '%s' ในห้อง '%s' (%d ข้อความ):\n", query, user.CurrentRoom, len(messages))
+	searchText += "================================\n"
+
+	for _, msg := range messages {
+		timestamp := msg.Timestamp.Format("02/01 15:04")
+		searchText += fmt.Sprintf("[%s] %s: %s\n", timestamp, msg.Username, msg.Content)
+	}
+
+	return conn.SendMessage([]byte(searchText))
+}
+
+// handleMyHistory shows user's message history
+func (s *commandService) handleMyHistory(conn Connection, args []string) error {
+	if s.messageRepo == nil {
+		return conn.SendMessage([]byte("❌ Message history ไม่พร้อมใช้งาน (ต้องเปิดใช้ MongoDB)"))
+	}
+
+	user, hasUser := getUserFromConnection(conn)
+	if !hasUser {
+		return conn.SendMessage([]byte("❌ ผู้ใช้ไม่ได้รับการยืนยันตัวตน"))
+	}
+
+	// Parse limit
+	limit := 20 // default
+	if len(args) > 0 {
+		if val, err := strconv.Atoi(args[0]); err == nil && val > 0 && val <= 100 {
+			limit = val
+		}
+	}
+
+	messages, err := s.messageRepo.GetUserMessageHistory(user.Username, limit)
+	if err != nil {
+		return conn.SendMessage([]byte(fmt.Sprintf("❌ ไม่สามารถดึงประวัติข้อความได้: %v", err)))
+	}
+
+	if len(messages) == 0 {
+		return conn.SendMessage([]byte("📭 คุณยังไม่เคยส่งข้อความ"))
+	}
+
+	historyText := fmt.Sprintf("📜 ประวัติข้อความของ %s (%d ข้อความล่าสุด):\n", user.Username, len(messages))
+	historyText += "================================\n"
+
+	for _, msg := range messages {
+		timestamp := msg.Timestamp.Format("02/01 15:04")
+		historyText += fmt.Sprintf("[%s] ห้อง '%s': %s\n", timestamp, msg.RoomName, msg.Content)
+	}
+
+	return conn.SendMessage([]byte(historyText))
 }

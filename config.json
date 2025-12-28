@@ -11,11 +11,18 @@
   "enable_metrics": true,
   "enable_health_check": true,
   "health_check_interval": 30000000000,
-  "port": ":9090",
+  "port": ":9091",
   "max_message_length": 500,
   "max_username_length": 50,
   "max_room_name_length": 50,
   "rate_limit_messages": 10,
   "rate_limit_window": 60000000000,
-  "enable_rate_limit": false
+  "enable_rate_limit": false,
+  "enable_mongodb": true,
+  "mongo_uri": "mongodb://localhost:27017",
+  "mongo_database": "realtime_chat",
+  "mongo_connect_timeout": 10000000000,
+  "mongo_ping_timeout": 5000000000,
+  "mongo_max_pool_size": 100,
+  "mongo_min_pool_size": 5
 }

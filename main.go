@@ -11,6 +11,7 @@ import (
 
 	"realtime-chat/internal/chat"
 	"realtime-chat/internal/config"
+	"realtime-chat/internal/database"
 	wsocket "realtime-chat/internal/websocket"
 
 	"github.com/gorilla/websocket"
@@ -75,8 +76,55 @@ func main() {
 	metrics := config.NewServerMetrics()
 
 	// สร้าง repositories
-	userRepo := chat.NewInMemoryUserRepository()
-	roomRepo := chat.NewInMemoryRoomRepository()
+	var userRepo chat.UserRepository
+	var roomRepo chat.RoomRepository
+	var messageRepo *database.MongoMessageRepository
+	var mongoDB *database.MongoDB
+
+	if cfg.EnableMongoDB {
+		log.Println("🔄 Initializing MongoDB connection...")
+		
+		// สร้าง MongoDB configuration
+		mongoConfig := &database.MongoConfig{
+			URI:            cfg.MongoURI,
+			Database:       cfg.MongoDatabase,
+			ConnectTimeout: cfg.MongoConnectTimeout,
+			PingTimeout:    cfg.MongoPingTimeout,
+			MaxPoolSize:    cfg.MongoMaxPoolSize,
+			MinPoolSize:    cfg.MongoMinPoolSize,
+		}
+
+		// เชื่อมต่อ MongoDB
+		var err error
+		mongoDB, err = database.NewMongoDB(mongoConfig)
+		if err != nil {
+			log.Printf("❌ Failed to connect to MongoDB: %v", err)
+			log.Println("🔄 Falling back to in-memory repositories")
+			cfg.EnableMongoDB = false
+		} else {
+			// สร้าง indexes
+			if err := mongoDB.CreateIndexes(); err != nil {
+				log.Printf("⚠️ Failed to create MongoDB indexes: %v", err)
+			}
+
+			// สร้าง MongoDB repositories
+			mongoUserRepo := database.NewMongoUserRepository(mongoDB)
+			mongoRoomRepo := database.NewMongoRoomRepository(mongoDB, mongoUserRepo)
+			messageRepo = database.NewMongoMessageRepository(mongoDB)
+
+			userRepo = mongoUserRepo
+			roomRepo = mongoRoomRepo
+
+			log.Println("✅ MongoDB repositories initialized")
+		}
+	}
+
+	// ถ้าไม่ใช้ MongoDB หรือเชื่อมต่อไม่ได้ ให้ใช้ in-memory repositories
+	if !cfg.EnableMongoDB {
+		log.Println("🔄 Using in-memory repositories")
+		userRepo = chat.NewInMemoryUserRepository()
+		roomRepo = chat.NewInMemoryRoomRepository()
+	}
 
 	// สร้าง services
 	userService := chat.NewUserService(userRepo, metrics)
@@ -96,6 +144,13 @@ func main() {
 
 	// สร้าง HTTP handler
 	handler := chat.NewHandler(wsManagerAdapted, userService, roomService, commandService, messageService, cfg)
+
+	// Set message repository if MongoDB is enabled
+	if cfg.EnableMongoDB && messageRepo != nil {
+		commandService.SetMessageRepository(messageRepo)
+		handler.SetMessageRepository(messageRepo)
+		log.Println("✅ Message persistence enabled")
+	}
 
 	// เริ่ม WebSocket manager ใน goroutine
 	go wsManager.Run()
@@ -141,6 +196,13 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
+		// ปิด MongoDB connection ถ้ามี
+		if mongoDB != nil {
+			if err := mongoDB.Close(); err != nil {
+				log.Printf("⚠️ Error closing MongoDB connection: %v", err)
+			}
+		}
+
 		if err := server.Shutdown(ctx); err != nil {
 			log.Printf("❌ Server shutdown error: %v", err)
 		} else {
@@ -156,6 +218,13 @@ func main() {
 	log.Printf("🏠 Room Manager: Ready (Max: %d)", cfg.MaxRooms)
 	log.Printf("📋 Command Handler: Ready")
 	log.Printf("📊 Message Service: Ready")
+	
+	if cfg.EnableMongoDB && mongoDB != nil {
+		log.Printf("🗄️  Database: MongoDB (%s/%s)", cfg.MongoURI, cfg.MongoDatabase)
+	} else {
+		log.Printf("🗄️  Database: In-Memory")
+	}
+	
 	log.Printf("⚙️  Configuration: Heartbeat=%v, ReadTimeout=%v, WriteTimeout=%v",
 		cfg.HeartbeatInterval, cfg.ReadTimeout, cfg.WriteTimeout)
 

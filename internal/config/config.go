@@ -128,6 +128,15 @@ type ServerConfig struct {
 	RateLimitMessages   int           `json:"rate_limit_messages"`
 	RateLimitWindow     time.Duration `json:"rate_limit_window"`
 	EnableRateLimit     bool          `json:"enable_rate_limit"`
+	
+	// Database settings
+	EnableMongoDB       bool          `json:"enable_mongodb"`
+	MongoURI            string        `json:"mongo_uri"`
+	MongoDatabase       string        `json:"mongo_database"`
+	MongoConnectTimeout time.Duration `json:"mongo_connect_timeout"`
+	MongoPingTimeout    time.Duration `json:"mongo_ping_timeout"`
+	MongoMaxPoolSize    uint64        `json:"mongo_max_pool_size"`
+	MongoMinPoolSize    uint64        `json:"mongo_min_pool_size"`
 }
 
 // DefaultServerConfig returns default server configuration
@@ -154,6 +163,15 @@ func DefaultServerConfig() *ServerConfig {
 		RateLimitMessages:   10,                // จำกัด 10 ข้อความ
 		RateLimitWindow:     1 * time.Minute,   // ต่อ 1 นาที
 		EnableRateLimit:     true,              // เปิดใช้ rate limiting
+		
+		// Database settings
+		EnableMongoDB:       false,             // ปิดใช้ MongoDB โดยค่าเริ่มต้น
+		MongoURI:            "mongodb://localhost:27017",
+		MongoDatabase:       "realtime_chat",
+		MongoConnectTimeout: 10 * time.Second,
+		MongoPingTimeout:    5 * time.Second,
+		MongoMaxPoolSize:    100,
+		MongoMinPoolSize:    5,
 	}
 }
 
@@ -477,6 +495,31 @@ func (cl *ConfigLoader) loadFromEnv(config *ServerConfig) {
 	
 	if enableRateLimit := os.Getenv("CHAT_ENABLE_RATE_LIMIT"); enableRateLimit != "" {
 		config.EnableRateLimit = enableRateLimit == "true"
+	}
+
+	// Database settings
+	if enableMongo := os.Getenv("CHAT_ENABLE_MONGODB"); enableMongo != "" {
+		config.EnableMongoDB = enableMongo == "true"
+	}
+	
+	if mongoURI := os.Getenv("CHAT_MONGO_URI"); mongoURI != "" {
+		config.MongoURI = mongoURI
+	}
+	
+	if mongoDatabase := os.Getenv("CHAT_MONGO_DATABASE"); mongoDatabase != "" {
+		config.MongoDatabase = mongoDatabase
+	}
+	
+	if mongoConnectTimeout := os.Getenv("CHAT_MONGO_CONNECT_TIMEOUT"); mongoConnectTimeout != "" {
+		if val, err := time.ParseDuration(mongoConnectTimeout); err == nil {
+			config.MongoConnectTimeout = val
+		}
+	}
+	
+	if mongoPingTimeout := os.Getenv("CHAT_MONGO_PING_TIMEOUT"); mongoPingTimeout != "" {
+		if val, err := time.ParseDuration(mongoPingTimeout); err == nil {
+			config.MongoPingTimeout = val
+		}
 	}
 }
 

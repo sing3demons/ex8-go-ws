@@ -24,6 +24,7 @@ type Handler struct {
 	config         *config.ServerConfig
 	rateLimiter    *config.RateLimiter
 	validator      *security.InputValidator
+	messageRepo    MessageRepository // Add message repository
 }
 
 // WebSocketManager interface for WebSocket connection management
@@ -52,7 +53,13 @@ func NewHandler(wsManager WebSocketManager, userService UserService, roomService
 		config:         cfg,
 		rateLimiter:    config.NewRateLimiter(cfg),
 		validator:      security.NewInputValidator(cfg),
+		messageRepo:    nil, // Will be set later if MongoDB is enabled
 	}
+}
+
+// SetMessageRepository sets the message repository for persistence
+func (h *Handler) SetMessageRepository(repo MessageRepository) {
+	h.messageRepo = repo
 }
 
 // HandleWebSocket handles WebSocket connection upgrades
@@ -218,7 +225,15 @@ func (h *Handler) handleRead(conn *websocket.Conn, connID, clientAddr string) {
 					Content:   validatedMessage,
 					Sender:    clientAddr,
 					Username:  chatUser.Username,
+					RoomName:  chatUser.CurrentRoom,
 					Timestamp: time.Now(),
+				}
+
+				// Save message to database if MongoDB is enabled
+				if h.messageRepo != nil {
+					if err := h.messageRepo.SaveMessage(message); err != nil {
+						log.Printf("⚠️ Failed to save message to database: %v", err)
+					}
 				}
 
 				// Broadcast ข้อความไปยัง clients ในห้องเดียวกัน (ไม่รวมผู้ส่ง)

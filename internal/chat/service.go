@@ -3,6 +3,7 @@ package chat
 import (
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -208,27 +209,29 @@ func (s *roomService) GetRoomCount() int {
 
 // commandService implements CommandService
 type commandService struct {
-	commands    map[string]*Command
-	userService UserService
-	roomService RoomService
-	msgService  MessageService
-	wsManager   WebSocketManager
-	metrics     *config.ServerMetrics
-	config      *config.ServerConfig
-	validator   *security.InputValidator
+	commands      map[string]*Command
+	userService   UserService
+	roomService   RoomService
+	msgService    MessageService
+	wsManager     WebSocketManager
+	metrics       *config.ServerMetrics
+	config        *config.ServerConfig
+	validator     *security.InputValidator
+	configManager *config.ConfigManager
 }
 
 // NewCommandService creates a new command service
-func NewCommandService(userService UserService, roomService RoomService, msgService MessageService, wsManager WebSocketManager, metrics *config.ServerMetrics, cfg *config.ServerConfig) CommandService {
+func NewCommandService(userService UserService, roomService RoomService, msgService MessageService, wsManager WebSocketManager, metrics *config.ServerMetrics, cfg *config.ServerConfig, configManager *config.ConfigManager) CommandService {
 	cs := &commandService{
-		commands:    make(map[string]*Command),
-		userService: userService,
-		roomService: roomService,
-		msgService:  msgService,
-		wsManager:   wsManager,
-		metrics:     metrics,
-		config:      cfg,
-		validator:   security.NewInputValidator(cfg),
+		commands:      make(map[string]*Command),
+		userService:   userService,
+		roomService:   roomService,
+		msgService:    msgService,
+		wsManager:     wsManager,
+		metrics:       metrics,
+		config:        cfg,
+		validator:     security.NewInputValidator(cfg),
+		configManager: configManager,
 	}
 
 	// ลงทะเบียนคำสั่งพื้นฐาน
@@ -356,6 +359,13 @@ func (s *commandService) registerBuiltinCommands() {
 		Description: "แสดงสถานะ rate limit ของคุณ",
 		Usage:       "/ratelimit",
 		Handler:     s.handleRateLimit,
+	})
+
+	s.RegisterCommand(&Command{
+		Name:        "config",
+		Description: "แสดงหรือแก้ไข configuration",
+		Usage:       "/config [show|set <key> <value>]",
+		Handler:     s.handleConfig,
 	})
 }
 
@@ -684,4 +694,108 @@ func (s *commandService) handleRateLimit(conn Connection, args []string) error {
 	rateLimitText += fmt.Sprintf("🏠 ความยาวชื่อห้องสูงสุด: %d ตัวอักษร\n", s.config.MaxRoomNameLength)
 
 	return conn.SendMessage([]byte(rateLimitText))
+}
+
+// handleConfig shows or updates configuration
+func (s *commandService) handleConfig(conn Connection, args []string) error {
+	user, hasUser := getUserFromConnection(conn)
+	if !hasUser {
+		return conn.SendMessage([]byte("❌ ผู้ใช้ไม่ได้รับการยืนยันตัวตน"))
+	}
+
+	// Simple admin check (in production, you'd have proper role management)
+	if user.Username != "admin" {
+		return conn.SendMessage([]byte("❌ คำสั่งนี้ใช้ได้เฉพาะ admin เท่านั้น"))
+	}
+
+	if len(args) == 0 || args[0] == "show" {
+		return s.handleConfigShow(conn)
+	}
+
+	if args[0] == "set" && len(args) >= 3 {
+		return s.handleConfigSet(conn, args[1], args[2])
+	}
+
+	return conn.SendMessage([]byte("❌ การใช้งาน: /config [show|set <key> <value>]"))
+}
+
+// handleConfigShow shows current configuration
+func (s *commandService) handleConfigShow(conn Connection) error {
+	if s.configManager == nil {
+		return conn.SendMessage([]byte("❌ Configuration manager ไม่พร้อมใช้งาน"))
+	}
+
+	summary := s.configManager.GetConfigSummary()
+	
+	configText := "⚙️ การตั้งค่าปัจจุบัน:\n"
+	configText += "===================\n"
+	
+	// Server settings
+	if server, ok := summary["server"].(map[string]interface{}); ok {
+		configText += "🖥️ Server:\n"
+		configText += fmt.Sprintf("  • Port: %v\n", server["port"])
+		configText += fmt.Sprintf("  • Max Connections: %v\n", server["max_connections"])
+		configText += fmt.Sprintf("  • Max Rooms: %v\n", server["max_rooms"])
+		configText += fmt.Sprintf("  • Max Users/Room: %v\n", server["max_users_per_room"])
+		configText += "\n"
+	}
+	
+	// Security settings
+	if security, ok := summary["security"].(map[string]interface{}); ok {
+		configText += "🔒 Security:\n"
+		configText += fmt.Sprintf("  • Max Message Length: %v\n", security["max_message_length"])
+		configText += fmt.Sprintf("  • Max Username Length: %v\n", security["max_username_length"])
+		configText += fmt.Sprintf("  • Rate Limit: %v msg/%v\n", security["rate_limit_messages"], security["rate_limit_window"])
+		configText += "\n"
+	}
+	
+	// Feature flags
+	if features, ok := summary["features"].(map[string]interface{}); ok {
+		configText += "🎛️ Features:\n"
+		configText += fmt.Sprintf("  • Metrics: %v\n", features["enable_metrics"])
+		configText += fmt.Sprintf("  • Health Check: %v\n", features["enable_health_check"])
+		configText += fmt.Sprintf("  • Rate Limiting: %v\n", features["enable_rate_limit"])
+	}
+
+	return conn.SendMessage([]byte(configText))
+}
+
+// handleConfigSet updates a configuration value
+func (s *commandService) handleConfigSet(conn Connection, key, value string) error {
+	if s.configManager == nil {
+		return conn.SendMessage([]byte("❌ Configuration manager ไม่พร้อมใช้งาน"))
+	}
+
+	// Parse value based on key
+	updates := make(map[string]interface{})
+	
+	switch key {
+	case "max_connections", "max_rooms", "max_users_per_room", "max_message_length", "max_username_length", "rate_limit_messages":
+		if val, err := strconv.Atoi(value); err == nil {
+			updates[key] = float64(val) // JSON unmarshaling uses float64 for numbers
+		} else {
+			return conn.SendMessage([]byte(fmt.Sprintf("❌ Invalid number value for %s: %s", key, value)))
+		}
+	case "heartbeat_interval", "rate_limit_window":
+		if _, err := time.ParseDuration(value); err == nil {
+			updates[key] = value
+		} else {
+			return conn.SendMessage([]byte(fmt.Sprintf("❌ Invalid duration value for %s: %s", key, value)))
+		}
+	case "enable_metrics", "enable_health_check", "enable_rate_limit":
+		if value == "true" || value == "false" {
+			updates[key] = value == "true"
+		} else {
+			return conn.SendMessage([]byte(fmt.Sprintf("❌ Invalid boolean value for %s: %s (use true/false)", key, value)))
+		}
+	default:
+		return conn.SendMessage([]byte(fmt.Sprintf("❌ Unknown configuration key: %s", key)))
+	}
+
+	// Apply updates
+	if err := s.configManager.UpdateConfig(updates); err != nil {
+		return conn.SendMessage([]byte(fmt.Sprintf("❌ Failed to update config: %v", err)))
+	}
+
+	return conn.SendMessage([]byte(fmt.Sprintf("✅ Updated %s = %s", key, value)))
 }

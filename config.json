@@ -1,0 +1,21 @@
+{
+  "max_connections": 1000,
+  "max_rooms": 100,
+  "max_users_per_room": 50,
+  "heartbeat_interval": 45000000000,
+  "read_timeout": 60000000000,
+  "write_timeout": 10000000000,
+  "pong_timeout": 60000000000,
+  "connection_timeout": 300000000000,
+  "broadcast_buffer": 256,
+  "enable_metrics": true,
+  "enable_health_check": true,
+  "health_check_interval": 30000000000,
+  "port": ":9090",
+  "max_message_length": 500,
+  "max_username_length": 50,
+  "max_room_name_length": 50,
+  "rate_limit_messages": 10,
+  "rate_limit_window": 60000000000,
+  "enable_rate_limit": false
+}

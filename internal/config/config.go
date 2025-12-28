@@ -1,6 +1,10 @@
 package config
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -337,4 +341,187 @@ func (rl *RateLimiter) GetRateLimitStatus(userID string) (int, int, time.Duratio
 	}
 
 	return remaining, rl.config.RateLimitMessages, timeRemaining
+}
+
+// ConfigLoader handles loading configuration from various sources
+type ConfigLoader struct {
+	configPath string
+	mutex      sync.RWMutex
+}
+
+// NewConfigLoader creates a new configuration loader
+func NewConfigLoader(configPath string) *ConfigLoader {
+	return &ConfigLoader{
+		configPath: configPath,
+	}
+}
+
+// LoadConfig loads configuration from file and environment variables
+func (cl *ConfigLoader) LoadConfig() (*ServerConfig, error) {
+	cl.mutex.Lock()
+	defer cl.mutex.Unlock()
+
+	// Start with default configuration
+	config := DefaultServerConfig()
+
+	// Try to load from file if it exists
+	if cl.configPath != "" {
+		if err := cl.loadFromFile(config); err != nil {
+			// Log error but continue with defaults
+			fmt.Printf("⚠️ Failed to load config file %s: %v\n", cl.configPath, err)
+		}
+	}
+
+	// Override with environment variables
+	cl.loadFromEnv(config)
+
+	return config, nil
+}
+
+// loadFromFile loads configuration from JSON file
+func (cl *ConfigLoader) loadFromFile(config *ServerConfig) error {
+	if _, err := os.Stat(cl.configPath); os.IsNotExist(err) {
+		return fmt.Errorf("config file does not exist: %s", cl.configPath)
+	}
+
+	data, err := os.ReadFile(cl.configPath)
+	if err != nil {
+		return fmt.Errorf("failed to read config file: %v", err)
+	}
+
+	if err := json.Unmarshal(data, config); err != nil {
+		return fmt.Errorf("failed to parse config file: %v", err)
+	}
+
+	fmt.Printf("✅ Loaded configuration from %s\n", cl.configPath)
+	return nil
+}
+
+// loadFromEnv loads configuration from environment variables
+func (cl *ConfigLoader) loadFromEnv(config *ServerConfig) {
+	// Server settings
+	if port := os.Getenv("CHAT_PORT"); port != "" {
+		config.Port = port
+	}
+	
+	if maxConn := os.Getenv("CHAT_MAX_CONNECTIONS"); maxConn != "" {
+		if val, err := strconv.Atoi(maxConn); err == nil {
+			config.MaxConnections = val
+		}
+	}
+	
+	if maxRooms := os.Getenv("CHAT_MAX_ROOMS"); maxRooms != "" {
+		if val, err := strconv.Atoi(maxRooms); err == nil {
+			config.MaxRooms = val
+		}
+	}
+	
+	if maxUsers := os.Getenv("CHAT_MAX_USERS_PER_ROOM"); maxUsers != "" {
+		if val, err := strconv.Atoi(maxUsers); err == nil {
+			config.MaxUsersPerRoom = val
+		}
+	}
+
+	// Timeout settings
+	if heartbeat := os.Getenv("CHAT_HEARTBEAT_INTERVAL"); heartbeat != "" {
+		if val, err := time.ParseDuration(heartbeat); err == nil {
+			config.HeartbeatInterval = val
+		}
+	}
+	
+	if readTimeout := os.Getenv("CHAT_READ_TIMEOUT"); readTimeout != "" {
+		if val, err := time.ParseDuration(readTimeout); err == nil {
+			config.ReadTimeout = val
+		}
+	}
+	
+	if writeTimeout := os.Getenv("CHAT_WRITE_TIMEOUT"); writeTimeout != "" {
+		if val, err := time.ParseDuration(writeTimeout); err == nil {
+			config.WriteTimeout = val
+		}
+	}
+
+	// Security settings
+	if maxMsgLen := os.Getenv("CHAT_MAX_MESSAGE_LENGTH"); maxMsgLen != "" {
+		if val, err := strconv.Atoi(maxMsgLen); err == nil {
+			config.MaxMessageLength = val
+		}
+	}
+	
+	if maxUserLen := os.Getenv("CHAT_MAX_USERNAME_LENGTH"); maxUserLen != "" {
+		if val, err := strconv.Atoi(maxUserLen); err == nil {
+			config.MaxUsernameLength = val
+		}
+	}
+	
+	if rateLimitMsg := os.Getenv("CHAT_RATE_LIMIT_MESSAGES"); rateLimitMsg != "" {
+		if val, err := strconv.Atoi(rateLimitMsg); err == nil {
+			config.RateLimitMessages = val
+		}
+	}
+	
+	if rateLimitWindow := os.Getenv("CHAT_RATE_LIMIT_WINDOW"); rateLimitWindow != "" {
+		if val, err := time.ParseDuration(rateLimitWindow); err == nil {
+			config.RateLimitWindow = val
+		}
+	}
+
+	// Feature flags
+	if enableMetrics := os.Getenv("CHAT_ENABLE_METRICS"); enableMetrics != "" {
+		config.EnableMetrics = enableMetrics == "true"
+	}
+	
+	if enableHealth := os.Getenv("CHAT_ENABLE_HEALTH_CHECK"); enableHealth != "" {
+		config.EnableHealthCheck = enableHealth == "true"
+	}
+	
+	if enableRateLimit := os.Getenv("CHAT_ENABLE_RATE_LIMIT"); enableRateLimit != "" {
+		config.EnableRateLimit = enableRateLimit == "true"
+	}
+}
+
+// SaveConfig saves current configuration to file
+func (cl *ConfigLoader) SaveConfig(config *ServerConfig) error {
+	cl.mutex.Lock()
+	defer cl.mutex.Unlock()
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %v", err)
+	}
+
+	if err := os.WriteFile(cl.configPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write config file: %v", err)
+	}
+
+	fmt.Printf("✅ Saved configuration to %s\n", cl.configPath)
+	return nil
+}
+
+// WatchConfig watches for configuration file changes (basic implementation)
+func (cl *ConfigLoader) WatchConfig(callback func(*ServerConfig)) error {
+	// This is a basic implementation - in production you might use fsnotify
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		
+		var lastModTime time.Time
+		if stat, err := os.Stat(cl.configPath); err == nil {
+			lastModTime = stat.ModTime()
+		}
+		
+		for range ticker.C {
+			if stat, err := os.Stat(cl.configPath); err == nil {
+				if stat.ModTime().After(lastModTime) {
+					lastModTime = stat.ModTime()
+					if newConfig, err := cl.LoadConfig(); err == nil {
+						fmt.Println("🔄 Configuration file changed, reloading...")
+						callback(newConfig)
+					}
+				}
+			}
+		}
+	}()
+	
+	return nil
 }

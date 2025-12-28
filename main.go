@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,8 +15,19 @@ import (
 type Connection struct {
 	ID       string
 	Conn     *websocket.Conn
+	User     *User // เพิ่ม User information
 	LastSeen time.Time
 	Send     chan []byte // Channel สำหรับส่งข้อความ
+}
+
+// User represents a chat user
+type User struct {
+	ID          string    `json:"id"`
+	Username    string    `json:"username"`
+	ConnID      string    `json:"conn_id"`
+	JoinedAt    time.Time `json:"joined_at"`
+	LastActive  time.Time `json:"last_active"`
+	IsAuthenticated bool  `json:"is_authenticated"`
 }
 
 // Message represents a message to be broadcasted
@@ -22,6 +35,7 @@ type Message struct {
 	Type      string    `json:"type"`
 	Content   string    `json:"content"`
 	Sender    string    `json:"sender"`
+	Username  string    `json:"username"` // เพิ่ม username
 	Timestamp time.Time `json:"timestamp"`
 }
 
@@ -31,6 +45,122 @@ type BroadcastMessage struct {
 	ExcludeID string // ID ของ connection ที่ไม่ต้องการส่งไป
 }
 
+// UserManager manages user authentication and sessions
+type UserManager struct {
+	users       map[string]*User  // connID -> User
+	usersByName map[string]*User  // username -> User
+	mutex       sync.RWMutex
+}
+
+// NewUserManager creates a new user manager
+func NewUserManager() *UserManager {
+	return &UserManager{
+		users:       make(map[string]*User),
+		usersByName: make(map[string]*User),
+	}
+}
+
+// RegisterUser registers a new user with username validation
+func (um *UserManager) RegisterUser(connID, username string) (*User, error) {
+	um.mutex.Lock()
+	defer um.mutex.Unlock()
+
+	// ตรวจสอบว่า username ว่างหรือไม่
+	if username == "" {
+		return nil, fmt.Errorf("username cannot be empty")
+	}
+
+	// ตรวจสอบว่า username ซ้ำหรือไม่
+	if _, exists := um.usersByName[username]; exists {
+		return nil, fmt.Errorf("username '%s' is already taken", username)
+	}
+
+	// สร้าง user ใหม่
+	user := &User{
+		ID:              generateUserID(),
+		Username:        username,
+		ConnID:          connID,
+		JoinedAt:        time.Now(),
+		LastActive:      time.Now(),
+		IsAuthenticated: true,
+	}
+
+	// เก็บ user
+	um.users[connID] = user
+	um.usersByName[username] = user
+
+	log.Printf("👤 User registered: %s (ConnID: %s)", username, connID)
+	return user, nil
+}
+
+// UnregisterUser removes a user
+func (um *UserManager) UnregisterUser(connID string) error {
+	um.mutex.Lock()
+	defer um.mutex.Unlock()
+
+	user, exists := um.users[connID]
+	if !exists {
+		return fmt.Errorf("user not found for connection %s", connID)
+	}
+
+	// ลบจาก maps
+	delete(um.users, connID)
+	delete(um.usersByName, user.Username)
+
+	log.Printf("👋 User unregistered: %s (ConnID: %s)", user.Username, connID)
+	return nil
+}
+
+// GetUser returns a user by connection ID
+func (um *UserManager) GetUser(connID string) (*User, bool) {
+	um.mutex.RLock()
+	defer um.mutex.RUnlock()
+	user, exists := um.users[connID]
+	return user, exists
+}
+
+// GetUserByName returns a user by username
+func (um *UserManager) GetUserByName(username string) (*User, bool) {
+	um.mutex.RLock()
+	defer um.mutex.RUnlock()
+	user, exists := um.usersByName[username]
+	return user, exists
+}
+
+// IsUsernameAvailable checks if a username is available
+func (um *UserManager) IsUsernameAvailable(username string) bool {
+	um.mutex.RLock()
+	defer um.mutex.RUnlock()
+	_, exists := um.usersByName[username]
+	return !exists
+}
+
+// GetAllUsers returns all registered users
+func (um *UserManager) GetAllUsers() []*User {
+	um.mutex.RLock()
+	defer um.mutex.RUnlock()
+	
+	users := make([]*User, 0, len(um.users))
+	for _, user := range um.users {
+		users = append(users, user)
+	}
+	return users
+}
+
+// UpdateLastActive updates user's last active time
+func (um *UserManager) UpdateLastActive(connID string) {
+	um.mutex.Lock()
+	defer um.mutex.Unlock()
+	
+	if user, exists := um.users[connID]; exists {
+		user.LastActive = time.Now()
+	}
+}
+
+// generateUserID creates a unique user ID
+func generateUserID() string {
+	return "user-" + time.Now().Format("20060102150405") + "-" + randomString(4)
+}
 // ConnectionManager manages all WebSocket connections
 type ConnectionManager struct {
 	connections map[string]*Connection
@@ -74,16 +204,17 @@ func (cm *ConnectionManager) registerConnection(conn *Connection) {
 	cm.connections[conn.ID] = conn
 	log.Printf("📝 Connection registered: %s (Total: %d)", conn.ID, len(cm.connections))
 
-	// ส่งข้อความต้อนรับ
-	welcomeMsg := &Message{
-		Type:      "system",
-		Content:   "ยินดีต้อนรับสู่ระบบแชท! 🎉",
+	// ส่งข้อความขอ username
+	authMsg := &Message{
+		Type:      "auth_request",
+		Content:   "กรุณาระบุชื่อผู้ใช้ของคุณ:",
 		Sender:    "System",
+		Username:  "System",
 		Timestamp: time.Now(),
 	}
 
 	select {
-	case conn.Send <- []byte(welcomeMsg.Content):
+	case conn.Send <- []byte(authMsg.Content):
 	default:
 		close(conn.Send)
 		delete(cm.connections, conn.ID)
@@ -96,6 +227,27 @@ func (cm *ConnectionManager) unregisterConnection(conn *Connection) {
 	defer cm.mutex.Unlock()
 
 	if _, exists := cm.connections[conn.ID]; exists {
+		// ถ้ามี user ให้แจ้งเตือนคนอื่น
+		if conn.User != nil && conn.User.IsAuthenticated {
+			// ส่งข้อความแจ้งว่ามีคนออก
+			leaveMsg := &Message{
+				Type:      "user_left",
+				Content:   fmt.Sprintf("👋 %s ออกจากระบบแล้ว", conn.User.Username),
+				Sender:    "System",
+				Username:  "System",
+				Timestamp: time.Now(),
+			}
+			
+			// Broadcast ข้อความแจ้งให้คนอื่นรู้
+			cm.broadcastMessage(&BroadcastMessage{
+				Message:   leaveMsg,
+				ExcludeID: "", // ส่งให้ทุกคน
+			})
+
+			// ลบ user จาก user manager
+			userManager.UnregisterUser(conn.ID)
+		}
+
 		delete(cm.connections, conn.ID)
 		close(conn.Send)
 		log.Printf("🗑️ Connection unregistered: %s (Total: %d)", conn.ID, len(cm.connections))
@@ -107,9 +259,17 @@ func (cm *ConnectionManager) broadcastMessage(broadcastMsg *BroadcastMessage) {
 	cm.mutex.RLock()
 	defer cm.mutex.RUnlock()
 
-	message := broadcastMsg.Message.Content
+	message := broadcastMsg.Message
 	excludeID := broadcastMsg.ExcludeID
 	sentCount := 0
+
+	// สร้างข้อความที่จะส่ง
+	var formattedMessage string
+	if message.Type == "text" && message.Username != "" {
+		formattedMessage = fmt.Sprintf("[%s]: %s", message.Username, message.Content)
+	} else {
+		formattedMessage = message.Content
+	}
 
 	for connID, conn := range cm.connections {
 		// ไม่ส่งข้อความกลับไปยังผู้ส่ง
@@ -118,7 +278,7 @@ func (cm *ConnectionManager) broadcastMessage(broadcastMsg *BroadcastMessage) {
 		}
 
 		select {
-		case conn.Send <- []byte(message):
+		case conn.Send <- []byte(formattedMessage):
 			sentCount++
 		default:
 			// Connection ไม่ตอบสนอง ลบออก
@@ -210,8 +370,9 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-// Global connection manager
+// Global connection manager and user manager
 var connectionManager *ConnectionManager
+var userManager *UserManager
 
 // handleWebSocket จัดการ WebSocket connections
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -260,16 +421,82 @@ func handleRead(conn *websocket.Conn, connID, clientAddr string) {
 		messageContent := string(rawMessage)
 		log.Printf("📨 Received from %s: %s", clientAddr, messageContent)
 
-		// สร้าง message object
-		message := &Message{
-			Type:      "text",
-			Content:   messageContent,
-			Sender:    clientAddr, // ใช้ client address เป็น sender ชั่วคราว
-			Timestamp: time.Now(),
+		// ดึง connection object
+		connection, exists := connectionManager.GetConnection(connID)
+		if !exists {
+			log.Printf("❌ Connection not found: %s", connID)
+			break
 		}
 
-		// Broadcast ข้อความไปยัง clients อื่น (ไม่รวมผู้ส่ง)
-		connectionManager.BroadcastMessage(message, connID)
+		// ตรวจสอบว่า user authenticated หรือยัง
+		if connection.User == nil || !connection.User.IsAuthenticated {
+			// ยังไม่ authenticated - ใช้ข้อความเป็น username
+			username := strings.TrimSpace(messageContent)
+			
+			// ตรวจสอบ username
+			if username == "" {
+				sendErrorMessage(connection, "❌ ชื่อผู้ใช้ไม่สามารถเว้นว่างได้ กรุณาระบุชื่อผู้ใช้:")
+				continue
+			}
+
+			// ลองลงทะเบียน user
+			user, err := userManager.RegisterUser(connID, username)
+			if err != nil {
+				sendErrorMessage(connection, fmt.Sprintf("❌ %s กรุณาเลือกชื่อผู้ใช้อื่น:", err.Error()))
+				continue
+			}
+
+			// เก็บ user ใน connection
+			connection.User = user
+
+			// ส่งข้อความต้อนรับ
+			welcomeMsg := fmt.Sprintf("🎉 ยินดีต้อนรับ %s! คุณสามารถเริ่มแชทได้แล้ว", username)
+			sendSystemMessage(connection, welcomeMsg)
+
+			// แจ้งให้คนอื่นรู้ว่ามีคนเข้ามา
+			joinMsg := &Message{
+				Type:      "user_joined",
+				Content:   fmt.Sprintf("👋 %s เข้าร่วมแชทแล้ว", username),
+				Sender:    "System",
+				Username:  "System",
+				Timestamp: time.Now(),
+			}
+			connectionManager.BroadcastMessage(joinMsg, connID)
+
+		} else {
+			// User authenticated แล้ว - ประมวลผลข้อความปกติ
+			userManager.UpdateLastActive(connID)
+
+			// สร้าง message object พร้อม username
+			message := &Message{
+				Type:      "text",
+				Content:   messageContent,
+				Sender:    clientAddr,
+				Username:  connection.User.Username,
+				Timestamp: time.Now(),
+			}
+
+			// Broadcast ข้อความไปยัง clients อื่น (ไม่รวมผู้ส่ง)
+			connectionManager.BroadcastMessage(message, connID)
+		}
+	}
+}
+
+// sendSystemMessage sends a system message to a specific connection
+func sendSystemMessage(conn *Connection, message string) {
+	select {
+	case conn.Send <- []byte(message):
+	default:
+		log.Printf("❌ Failed to send system message to %s", conn.ID)
+	}
+}
+
+// sendErrorMessage sends an error message to a specific connection
+func sendErrorMessage(conn *Connection, message string) {
+	select {
+	case conn.Send <- []byte(message):
+	default:
+		log.Printf("❌ Failed to send error message to %s", conn.ID)
 	}
 }
 
@@ -316,8 +543,9 @@ func handleWrite(conn *websocket.Conn, connID, clientAddr string) {
 }
 
 func main() {
-	// สร้าง connection manager
+	// สร้าง managers
 	connectionManager = NewConnectionManager()
+	userManager = NewUserManager()
 
 	// เริ่ม connection manager ใน goroutine
 	go connectionManager.Run()
@@ -330,10 +558,11 @@ func main() {
 
 	// เริ่มต้น server
 	port := ":9090"
-	log.Printf("🚀 Starting WebSocket Chat Server on port %s", port)
+	log.Printf("� Startingt WebSocket Chat Server on port %s", port)
 	log.Printf("📡 WebSocket endpoint: ws://localhost%s/ws", port)
 	log.Printf("🌐 Test page: http://localhost%s", port)
 	log.Printf("👥 Connection Manager: Ready")
+	log.Printf("🔐 User Manager: Ready")
 
 	err := http.ListenAndServe(port, nil)
 	if err != nil {

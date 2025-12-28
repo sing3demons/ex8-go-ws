@@ -9,6 +9,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"realtime-chat/internal/config"
+	"realtime-chat/internal/security"
 	wsocket "realtime-chat/internal/websocket"
 )
 
@@ -21,6 +22,8 @@ type Handler struct {
 	commandService CommandService
 	messageService MessageService
 	config         *config.ServerConfig
+	rateLimiter    *config.RateLimiter
+	validator      *security.InputValidator
 }
 
 // WebSocketManager interface for WebSocket connection management
@@ -47,6 +50,8 @@ func NewHandler(wsManager WebSocketManager, userService UserService, roomService
 		commandService: commandService,
 		messageService: messageService,
 		config:         cfg,
+		rateLimiter:    config.NewRateLimiter(cfg),
+		validator:      security.NewInputValidator(cfg),
 	}
 }
 
@@ -118,14 +123,15 @@ func (h *Handler) handleRead(conn *websocket.Conn, connID, clientAddr string) {
 			// ยังไม่ authenticated - ใช้ข้อความเป็น username
 			username := strings.TrimSpace(messageContent)
 			
-			// ตรวจสอบ username
-			if username == "" {
-				h.sendErrorMessage(connection, "❌ ชื่อผู้ใช้ไม่สามารถเว้นว่างได้ กรุณาระบุชื่อผู้ใช้:")
+			// Validate username
+			validatedUsername, err := h.validator.ValidateUsername(username)
+			if err != nil {
+				h.sendErrorMessage(connection, fmt.Sprintf("❌ %s", err.Error()))
 				continue
 			}
 
 			// ลองลงทะเบียน user
-			newUser, err := h.userService.RegisterUser(connID, username)
+			newUser, err := h.userService.RegisterUser(connID, validatedUsername)
 			if err != nil {
 				h.sendErrorMessage(connection, fmt.Sprintf("❌ %s กรุณาเลือกชื่อผู้ใช้อื่น:", err.Error()))
 				continue
@@ -141,13 +147,13 @@ func (h *Handler) handleRead(conn *websocket.Conn, connID, clientAddr string) {
 			}
 
 			// ส่งข้อความต้อนรับ
-			welcomeMsg := fmt.Sprintf("🎉 ยินดีต้อนรับ %s! คุณอยู่ในห้อง 'general' แล้ว", username)
+			welcomeMsg := fmt.Sprintf("🎉 ยินดีต้อนรับ %s! คุณอยู่ในห้อง 'general' แล้ว", validatedUsername)
 			h.sendSystemMessage(connection, welcomeMsg)
 
 			// แจ้งให้คนในห้องเดียวกันรู้ว่ามีคนเข้ามา
 			joinMsg := &Message{
 				Type:      "user_joined",
-				Content:   fmt.Sprintf("👋 %s เข้าร่วมห้อง 'general' แล้ว", username),
+				Content:   fmt.Sprintf("👋 %s เข้าร่วมห้อง 'general' แล้ว", validatedUsername),
 				Sender:    "System",
 				Username:  "System",
 				Timestamp: time.Now(),
@@ -159,10 +165,24 @@ func (h *Handler) handleRead(conn *websocket.Conn, connID, clientAddr string) {
 			if chatUser, ok := user.(*User); ok && chatUser.IsAuthenticated {
 				h.userService.UpdateLastActive(connID)
 
+				// Check rate limit
+				if !h.rateLimiter.CheckRateLimit(chatUser.ID) {
+					remaining, _, timeRemaining := h.rateLimiter.GetRateLimitStatus(chatUser.ID)
+					h.sendErrorMessage(connection, fmt.Sprintf("⚠️ Rate limit exceeded! You can send %d more messages in %v", remaining, timeRemaining.Round(time.Second)))
+					continue
+				}
+
 				// ตรวจสอบว่าเป็นคำสั่งหรือไม่
 				if strings.HasPrefix(messageContent, "/") {
+					// Validate command
+					validatedCommand, err := h.validator.ValidateCommand(messageContent)
+					if err != nil {
+						h.sendErrorMessage(connection, fmt.Sprintf("❌ Invalid command: %s", err.Error()))
+						continue
+					}
+
 					// ประมวลผลคำสั่ง
-					err := h.commandService.ExecuteCommand(connection, messageContent)
+					err = h.commandService.ExecuteCommand(connection, validatedCommand)
 					if err != nil {
 						if err.Error() == "not a command" {
 							// ไม่ใช่คำสั่ง ประมวลผลเป็นข้อความธรรมดา
@@ -185,10 +205,17 @@ func (h *Handler) handleRead(conn *websocket.Conn, connID, clientAddr string) {
 					continue
 				}
 
+				// Validate message content
+				validatedMessage, err := h.validator.ValidateMessage(messageContent)
+				if err != nil {
+					h.sendErrorMessage(connection, fmt.Sprintf("❌ %s", err.Error()))
+					continue
+				}
+
 				// สร้าง message object พร้อม username
 				message := &Message{
 					Type:      "text",
-					Content:   messageContent,
+					Content:   validatedMessage,
 					Sender:    clientAddr,
 					Username:  chatUser.Username,
 					Timestamp: time.Now(),
@@ -209,6 +236,9 @@ func (h *Handler) handleWrite(conn *websocket.Conn, connID, clientAddr string) {
 		ticker.Stop()
 		conn.Close()
 	}()
+
+	// รอให้ connection ถูก register ก่อน
+	time.Sleep(100 * time.Millisecond)
 
 	// ดึง connection object จาก manager
 	connection, exists := h.wsManager.GetConnection(connID)

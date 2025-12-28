@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"realtime-chat/internal/config"
+	"realtime-chat/internal/security"
 )
 
 // UserService handles user business logic
@@ -214,6 +215,7 @@ type commandService struct {
 	wsManager   WebSocketManager
 	metrics     *config.ServerMetrics
 	config      *config.ServerConfig
+	validator   *security.InputValidator
 }
 
 // NewCommandService creates a new command service
@@ -226,6 +228,7 @@ func NewCommandService(userService UserService, roomService RoomService, msgServ
 		wsManager:   wsManager,
 		metrics:     metrics,
 		config:      cfg,
+		validator:   security.NewInputValidator(cfg),
 	}
 
 	// ลงทะเบียนคำสั่งพื้นฐาน
@@ -347,6 +350,13 @@ func (s *commandService) registerBuiltinCommands() {
 		Usage:       "/health",
 		Handler:     s.handleHealth,
 	})
+
+	s.RegisterCommand(&Command{
+		Name:        "ratelimit",
+		Description: "แสดงสถานะ rate limit ของคุณ",
+		Usage:       "/ratelimit",
+		Handler:     s.handleRateLimit,
+	})
 }
 
 // Command handlers
@@ -417,18 +427,25 @@ func (s *commandService) handleJoin(conn Connection, args []string) error {
 	}
 
 	roomName := args[0]
+	
+	// Validate room name
+	validatedRoomName, err := s.validator.ValidateRoomName(roomName)
+	if err != nil {
+		return conn.SendMessage([]byte(fmt.Sprintf("❌ %s", err.Error())))
+	}
+	
 	user, hasUser := getUserFromConnection(conn)
 	if !hasUser {
 		return conn.SendMessage([]byte("❌ ผู้ใช้ไม่ได้รับการยืนยันตัวตน"))
 	}
 
-	if user.CurrentRoom == roomName {
-		return conn.SendMessage([]byte(fmt.Sprintf("❌ คุณอยู่ในห้อง '%s' อยู่แล้ว", roomName)))
+	if user.CurrentRoom == validatedRoomName {
+		return conn.SendMessage([]byte(fmt.Sprintf("❌ คุณอยู่ในห้อง '%s' อยู่แล้ว", validatedRoomName)))
 	}
 
-	_, exists := s.roomService.GetRoom(roomName)
+	_, exists := s.roomService.GetRoom(validatedRoomName)
 	if !exists {
-		return conn.SendMessage([]byte(fmt.Sprintf("❌ ไม่พบห้อง '%s' ใช้ /create %s เพื่อสร้างห้องใหม่", roomName, roomName)))
+		return conn.SendMessage([]byte(fmt.Sprintf("❌ ไม่พบห้อง '%s' ใช้ /create %s เพื่อสร้างห้องใหม่", validatedRoomName, validatedRoomName)))
 	}
 
 	// ออกจากห้องเก่า
@@ -445,23 +462,23 @@ func (s *commandService) handleJoin(conn Connection, args []string) error {
 	}
 
 	// เข้าห้องใหม่
-	err := s.roomService.JoinRoom(user, roomName)
+	err = s.roomService.JoinRoom(user, validatedRoomName)
 	if err != nil {
-		return conn.SendMessage([]byte(fmt.Sprintf("❌ ไม่สามารถเข้าห้อง '%s': %s", roomName, err.Error())))
+		return conn.SendMessage([]byte(fmt.Sprintf("❌ ไม่สามารถเข้าห้อง '%s': %s", validatedRoomName, err.Error())))
 	}
 
 	// ส่งข้อความยืนยัน
-	conn.SendMessage([]byte(fmt.Sprintf("✅ เข้าร่วมห้อง '%s' เรียบร้อยแล้ว", roomName)))
+	conn.SendMessage([]byte(fmt.Sprintf("✅ เข้าร่วมห้อง '%s' เรียบร้อยแล้ว", validatedRoomName)))
 
 	// แจ้งคนในห้องใหม่
 	joinMsg := &Message{
 		Type:      "user_joined_room",
-		Content:   fmt.Sprintf("👋 %s เข้าร่วมห้อง '%s' แล้ว", user.Username, roomName),
+		Content:   fmt.Sprintf("👋 %s เข้าร่วมห้อง '%s' แล้ว", user.Username, validatedRoomName),
 		Sender:    "System",
 		Username:  "System",
 		Timestamp: time.Now(),
 	}
-	s.msgService.BroadcastToRoom(joinMsg, conn.GetID(), roomName)
+	s.msgService.BroadcastToRoom(joinMsg, conn.GetID(), validatedRoomName)
 
 	return nil
 }
@@ -526,35 +543,33 @@ func (s *commandService) handleCreate(conn Connection, args []string) error {
 	}
 
 	roomName := args[0]
+	
+	// Validate room name
+	validatedRoomName, err := s.validator.ValidateRoomName(roomName)
+	if err != nil {
+		return conn.SendMessage([]byte(fmt.Sprintf("❌ %s", err.Error())))
+	}
+	
 	user, hasUser := getUserFromConnection(conn)
 	if !hasUser {
 		return conn.SendMessage([]byte("❌ ผู้ใช้ไม่ได้รับการยืนยันตัวตน"))
 	}
 
-	// ตรวจสอบชื่อห้อง
-	if roomName == "" || len(roomName) < 2 {
-		return conn.SendMessage([]byte("❌ ชื่อห้องต้องมีอย่างน้อย 2 ตัวอักษร"))
-	}
-
-	if strings.Contains(roomName, " ") {
-		return conn.SendMessage([]byte("❌ ชื่อห้องไม่สามารถมีช่องว่างได้"))
-	}
-
 	// สร้างห้องใหม่
-	_, err := s.roomService.CreateRoom(roomName, user.Username)
+	_, err = s.roomService.CreateRoom(validatedRoomName, user.Username)
 	if err != nil {
-		return conn.SendMessage([]byte(fmt.Sprintf("❌ ไม่สามารถสร้างห้อง '%s': %s", roomName, err.Error())))
+		return conn.SendMessage([]byte(fmt.Sprintf("❌ ไม่สามารถสร้างห้อง '%s': %s", validatedRoomName, err.Error())))
 	}
 
 	// เข้าห้องที่สร้างใหม่อัตโนมัติ
 	oldRoom := user.CurrentRoom
-	err = s.roomService.JoinRoom(user, roomName)
+	err = s.roomService.JoinRoom(user, validatedRoomName)
 	if err != nil {
 		return conn.SendMessage([]byte(fmt.Sprintf("❌ สร้างห้องสำเร็จแต่ไม่สามารถเข้าห้องได้: %s", err.Error())))
 	}
 
 	// ส่งข้อความยืนยัน
-	conn.SendMessage([]byte(fmt.Sprintf("✅ สร้างห้อง '%s' และเข้าร่วมเรียบร้อยแล้ว", roomName)))
+	conn.SendMessage([]byte(fmt.Sprintf("✅ สร้างห้อง '%s' และเข้าร่วมเรียบร้อยแล้ว", validatedRoomName)))
 
 	// แจ้งคนในห้องเก่า
 	if oldRoom != "" {
@@ -571,7 +586,7 @@ func (s *commandService) handleCreate(conn Connection, args []string) error {
 	// แจ้งทุกคนว่ามีห้องใหม่
 	announceMsg := &Message{
 		Type:      "room_created",
-		Content:   fmt.Sprintf("🏠 %s สร้างห้อง '%s' ใหม่แล้ว ใช้ /join %s เพื่อเข้าร่วม", user.Username, roomName, roomName),
+		Content:   fmt.Sprintf("🏠 %s สร้างห้อง '%s' ใหม่แล้ว ใช้ /join %s เพื่อเข้าร่วม", user.Username, validatedRoomName, validatedRoomName),
 		Sender:    "System",
 		Username:  "System",
 		Timestamp: time.Now(),
@@ -642,4 +657,31 @@ func (s *commandService) handleHealth(conn Connection, args []string) error {
 	}
 	
 	return conn.SendMessage([]byte("❌ ไม่สามารถดึงข้อมูลสุขภาพการเชื่อมต่อได้"))
+}
+
+// handleRateLimit shows rate limit status for the user
+func (s *commandService) handleRateLimit(conn Connection, args []string) error {
+	user, hasUser := getUserFromConnection(conn)
+	if !hasUser {
+		return conn.SendMessage([]byte("❌ ผู้ใช้ไม่ได้รับการยืนยันตัวตน"))
+	}
+
+	// Get rate limit status from handler (we need to access it somehow)
+	// For now, we'll show the configuration
+	rateLimitText := "⚡ สถานะ Rate Limit:\n"
+	rateLimitText += "==================\n"
+	rateLimitText += fmt.Sprintf("👤 ผู้ใช้: %s\n", user.Username)
+	rateLimitText += fmt.Sprintf("📊 จำกัด: %d ข้อความต่อ %v\n", s.config.RateLimitMessages, s.config.RateLimitWindow)
+	
+	if s.config.EnableRateLimit {
+		rateLimitText += "✅ Rate limiting: เปิดใช้งาน\n"
+	} else {
+		rateLimitText += "❌ Rate limiting: ปิดใช้งาน\n"
+	}
+	
+	rateLimitText += fmt.Sprintf("📏 ความยาวข้อความสูงสุด: %d ตัวอักษร\n", s.config.MaxMessageLength)
+	rateLimitText += fmt.Sprintf("👤 ความยาว username สูงสุด: %d ตัวอักษร\n", s.config.MaxUsernameLength)
+	rateLimitText += fmt.Sprintf("🏠 ความยาวชื่อห้องสูงสุด: %d ตัวอักษร\n", s.config.MaxRoomNameLength)
+
+	return conn.SendMessage([]byte(rateLimitText))
 }

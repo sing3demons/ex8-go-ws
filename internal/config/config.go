@@ -116,6 +116,14 @@ type ServerConfig struct {
 	EnableHealthCheck   bool          `json:"enable_health_check"`
 	HealthCheckInterval time.Duration `json:"health_check_interval"`
 	Port                string        `json:"port"`
+	
+	// Security settings
+	MaxMessageLength    int           `json:"max_message_length"`
+	MaxUsernameLength   int           `json:"max_username_length"`
+	MaxRoomNameLength   int           `json:"max_room_name_length"`
+	RateLimitMessages   int           `json:"rate_limit_messages"`
+	RateLimitWindow     time.Duration `json:"rate_limit_window"`
+	EnableRateLimit     bool          `json:"enable_rate_limit"`
 }
 
 // DefaultServerConfig returns default server configuration
@@ -134,6 +142,14 @@ func DefaultServerConfig() *ServerConfig {
 		EnableHealthCheck:   true,
 		HealthCheckInterval: 30 * time.Second,  // ตรวจสอบ health ทุก 30 วินาที
 		Port:                ":9090",
+		
+		// Security settings
+		MaxMessageLength:    1000,              // จำกัดความยาวข้อความ
+		MaxUsernameLength:   50,                // จำกัดความยาว username
+		MaxRoomNameLength:   50,                // จำกัดความยาวชื่อห้อง
+		RateLimitMessages:   10,                // จำกัด 10 ข้อความ
+		RateLimitWindow:     1 * time.Minute,   // ต่อ 1 นาที
+		EnableRateLimit:     true,              // เปิดใช้ rate limiting
 	}
 }
 
@@ -232,4 +248,93 @@ func (sm *ServerMetrics) GetMetrics() *ServerMetrics {
 		MessageRate:       messageRate,
 		ConnectionRate:    connectionRate,
 	}
+}
+
+// RateLimiter manages rate limiting per user
+type RateLimiter struct {
+	limits map[string]*UserRateLimit
+	mutex  sync.RWMutex
+	config *ServerConfig
+}
+
+// UserRateLimit tracks rate limiting for a specific user
+type UserRateLimit struct {
+	MessageCount int
+	WindowStart  time.Time
+	mutex        sync.Mutex
+}
+
+// NewRateLimiter creates a new rate limiter
+func NewRateLimiter(config *ServerConfig) *RateLimiter {
+	return &RateLimiter{
+		limits: make(map[string]*UserRateLimit),
+		config: config,
+	}
+}
+
+// CheckRateLimit checks if a user can send a message
+func (rl *RateLimiter) CheckRateLimit(userID string) bool {
+	if !rl.config.EnableRateLimit {
+		return true
+	}
+
+	rl.mutex.Lock()
+	defer rl.mutex.Unlock()
+
+	now := time.Now()
+	
+	// Get or create user rate limit
+	userLimit, exists := rl.limits[userID]
+	if !exists {
+		userLimit = &UserRateLimit{
+			MessageCount: 0,
+			WindowStart:  now,
+		}
+		rl.limits[userID] = userLimit
+	}
+
+	userLimit.mutex.Lock()
+	defer userLimit.mutex.Unlock()
+
+	// Check if window has expired
+	if now.Sub(userLimit.WindowStart) > rl.config.RateLimitWindow {
+		// Reset window
+		userLimit.MessageCount = 0
+		userLimit.WindowStart = now
+	}
+
+	// Check if user has exceeded limit
+	if userLimit.MessageCount >= rl.config.RateLimitMessages {
+		return false
+	}
+
+	// Increment message count
+	userLimit.MessageCount++
+	return true
+}
+
+// GetRateLimitStatus returns current rate limit status for a user
+func (rl *RateLimiter) GetRateLimitStatus(userID string) (int, int, time.Duration) {
+	rl.mutex.RLock()
+	defer rl.mutex.RUnlock()
+
+	userLimit, exists := rl.limits[userID]
+	if !exists {
+		return 0, rl.config.RateLimitMessages, rl.config.RateLimitWindow
+	}
+
+	userLimit.mutex.Lock()
+	defer userLimit.mutex.Unlock()
+
+	remaining := rl.config.RateLimitMessages - userLimit.MessageCount
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	timeRemaining := rl.config.RateLimitWindow - time.Since(userLimit.WindowStart)
+	if timeRemaining < 0 {
+		timeRemaining = 0
+	}
+
+	return remaining, rl.config.RateLimitMessages, timeRemaining
 }

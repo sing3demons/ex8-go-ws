@@ -1,17 +1,198 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-// Connection represents a WebSocket connection with metadata
+// ServerConfig holds server configuration
+type ServerConfig struct {
+	MaxConnections    int           `json:"max_connections"`
+	MaxRooms          int           `json:"max_rooms"`
+	MaxUsersPerRoom   int           `json:"max_users_per_room"`
+	HeartbeatInterval time.Duration `json:"heartbeat_interval"`
+	ReadTimeout       time.Duration `json:"read_timeout"`
+	WriteTimeout      time.Duration `json:"write_timeout"`
+	BroadcastBuffer   int           `json:"broadcast_buffer"`
+	EnableMetrics     bool          `json:"enable_metrics"`
+}
+
+// DefaultServerConfig returns default server configuration
+func DefaultServerConfig() *ServerConfig {
+	return &ServerConfig{
+		MaxConnections:    1000,
+		MaxRooms:          100,
+		MaxUsersPerRoom:   50,
+		HeartbeatInterval: 54 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		BroadcastBuffer:   256,
+		EnableMetrics:     true,
+	}
+}
+
+// ServerMetrics holds server performance metrics
+type ServerMetrics struct {
+	TotalConnections    int64         `json:"total_connections"`
+	ActiveConnections   int64         `json:"active_connections"`
+	TotalMessages       int64         `json:"total_messages"`
+	TotalCommands       int64         `json:"total_commands"`
+	TotalRooms          int64         `json:"total_rooms"`
+	TotalUsers          int64         `json:"total_users"`
+	StartTime           time.Time     `json:"start_time"`
+	LastMessageTime     time.Time     `json:"last_message_time"`
+	MessageRate         float64       `json:"message_rate"`
+	ConnectionRate      float64       `json:"connection_rate"`
+	mutex               sync.RWMutex
+}
+
+// NewServerMetrics creates new server metrics
+func NewServerMetrics() *ServerMetrics {
+	return &ServerMetrics{
+		StartTime: time.Now(),
+	}
+}
+
+// IncrementConnections increments connection count
+func (sm *ServerMetrics) IncrementConnections() {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+	sm.TotalConnections++
+	sm.ActiveConnections++
+}
+
+// DecrementConnections decrements active connection count
+func (sm *ServerMetrics) DecrementConnections() {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+	sm.ActiveConnections--
+}
+
+// IncrementMessages increments message count
+func (sm *ServerMetrics) IncrementMessages() {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+	sm.TotalMessages++
+	sm.LastMessageTime = time.Now()
+}
+
+// IncrementCommands increments command count
+func (sm *ServerMetrics) IncrementCommands() {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+	sm.TotalCommands++
+}
+
+// IncrementRooms increments room count
+func (sm *ServerMetrics) IncrementRooms() {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+	sm.TotalRooms++
+}
+
+// IncrementUsers increments user count
+func (sm *ServerMetrics) IncrementUsers() {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+	sm.TotalUsers++
+}
+
+// DecrementUsers decrements user count
+func (sm *ServerMetrics) DecrementUsers() {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+	sm.TotalUsers--
+}
+
+// GetMetrics returns current metrics
+func (sm *ServerMetrics) GetMetrics() *ServerMetrics {
+	sm.mutex.RLock()
+	defer sm.mutex.RUnlock()
+	
+	// Calculate rates
+	uptime := time.Since(sm.StartTime).Seconds()
+	messageRate := float64(sm.TotalMessages) / uptime
+	connectionRate := float64(sm.TotalConnections) / uptime
+	
+	return &ServerMetrics{
+		TotalConnections:  sm.TotalConnections,
+		ActiveConnections: sm.ActiveConnections,
+		TotalMessages:     sm.TotalMessages,
+		TotalCommands:     sm.TotalCommands,
+		TotalRooms:        sm.TotalRooms,
+		TotalUsers:        sm.TotalUsers,
+		StartTime:         sm.StartTime,
+		LastMessageTime:   sm.LastMessageTime,
+		MessageRate:       messageRate,
+		ConnectionRate:    connectionRate,
+	}
+}
+
+// ResourceManager manages server resources and limits
+type ResourceManager struct {
+	config  *ServerConfig
+	metrics *ServerMetrics
+	mutex   sync.RWMutex
+}
+
+// NewResourceManager creates a new resource manager
+func NewResourceManager(config *ServerConfig) *ResourceManager {
+	return &ResourceManager{
+		config:  config,
+		metrics: NewServerMetrics(),
+	}
+}
+
+// CanAcceptConnection checks if server can accept new connection
+func (rm *ResourceManager) CanAcceptConnection() bool {
+	rm.mutex.RLock()
+	defer rm.mutex.RUnlock()
+	return rm.metrics.ActiveConnections < int64(rm.config.MaxConnections)
+}
+
+// CanCreateRoom checks if server can create new room
+func (rm *ResourceManager) CanCreateRoom() bool {
+	rm.mutex.RLock()
+	defer rm.mutex.RUnlock()
+	return rm.metrics.TotalRooms < int64(rm.config.MaxRooms)
+}
+
+// GetConfig returns server configuration
+func (rm *ResourceManager) GetConfig() *ServerConfig {
+	rm.mutex.RLock()
+	defer rm.mutex.RUnlock()
+	return rm.config
+}
+
+// GetMetrics returns server metrics
+func (rm *ResourceManager) GetMetrics() *ServerMetrics {
+	return rm.metrics.GetMetrics()
+}
+
+// LogMetrics logs current metrics
+func (rm *ResourceManager) LogMetrics() {
+	metrics := rm.GetMetrics()
+	uptime := time.Since(metrics.StartTime)
+	
+	log.Printf("📊 Server Metrics:")
+	log.Printf("   ⏱️  Uptime: %v", uptime.Round(time.Second))
+	log.Printf("   🔗 Connections: %d active / %d total", metrics.ActiveConnections, metrics.TotalConnections)
+	log.Printf("   💬 Messages: %d total (%.2f/sec)", metrics.TotalMessages, metrics.MessageRate)
+	log.Printf("   📋 Commands: %d total", metrics.TotalCommands)
+	log.Printf("   🏠 Rooms: %d total", metrics.TotalRooms)
+	log.Printf("   👥 Users: %d active", metrics.TotalUsers)
+	log.Printf("   📈 Connection Rate: %.2f/sec", metrics.ConnectionRate)
+}
 type Connection struct {
 	ID       string
 	Conn     *websocket.Conn
@@ -132,6 +313,14 @@ func (ch *CommandHandler) registerBuiltinCommands() {
 		Usage:       "/create <room_name>",
 		Handler:     ch.handleCreate,
 	})
+	
+	// คำสั่ง /stats
+	ch.RegisterCommand(&Command{
+		Name:        "stats",
+		Description: "แสดงสถิติเซิร์ฟเวอร์",
+		Usage:       "/stats",
+		Handler:     ch.handleStats,
+	})
 }
 
 // RegisterCommand registers a new command
@@ -169,6 +358,7 @@ func (ch *CommandHandler) ExecuteCommand(conn *Connection, message string) error
 	
 	// เรียกใช้คำสั่ง
 	log.Printf("🎯 Executing command: /%s by %s", commandName, conn.User.Username)
+	resourceManager.metrics.IncrementCommands()
 	return cmd.Handler(conn, args)
 }
 
@@ -419,6 +609,31 @@ func (ch *CommandHandler) handleCreate(conn *Connection, args []string) error {
 	
 	return nil
 }
+
+// handleStats shows server statistics
+func (ch *CommandHandler) handleStats(conn *Connection, args []string) error {
+	metrics := resourceManager.GetMetrics()
+	config := resourceManager.GetConfig()
+	uptime := time.Since(metrics.StartTime)
+	
+	statsText := "📊 สถิติเซิร์ฟเวอร์:\n"
+	statsText += "==================\n"
+	statsText += fmt.Sprintf("⏱️  เวลาทำงาน: %v\n", uptime.Round(time.Second))
+	statsText += fmt.Sprintf("🔗 การเชื่อมต่อ: %d/%d (%d รวม)\n", metrics.ActiveConnections, config.MaxConnections, metrics.TotalConnections)
+	statsText += fmt.Sprintf("👥 ผู้ใช้: %d คน\n", metrics.TotalUsers)
+	statsText += fmt.Sprintf("🏠 ห้อง: %d/%d ห้อง\n", metrics.TotalRooms, config.MaxRooms)
+	statsText += fmt.Sprintf("💬 ข้อความ: %d ข้อความ (%.2f/วินาที)\n", metrics.TotalMessages, metrics.MessageRate)
+	statsText += fmt.Sprintf("📋 คำสั่ง: %d คำสั่ง\n", metrics.TotalCommands)
+	statsText += fmt.Sprintf("📈 อัตราการเชื่อมต่อ: %.2f/วินาที\n", metrics.ConnectionRate)
+	
+	if !metrics.LastMessageTime.IsZero() {
+		timeSinceLastMsg := time.Since(metrics.LastMessageTime)
+		statsText += fmt.Sprintf("🕐 ข้อความล่าสุด: %v ที่แล้ว\n", timeSinceLastMsg.Round(time.Second))
+	}
+	
+	sendSystemMessage(conn, statsText)
+	return nil
+}
 type RoomManager struct {
 	rooms map[string]*Room
 	mutex sync.RWMutex
@@ -450,6 +665,11 @@ func (rm *RoomManager) CreateRoom(name, creatorUsername string) (*Room, error) {
 	rm.mutex.Lock()
 	defer rm.mutex.Unlock()
 
+	// ตรวจสอบ resource limits
+	if !resourceManager.CanCreateRoom() {
+		return nil, fmt.Errorf("server room limit reached (%d/%d)", resourceManager.metrics.TotalRooms, resourceManager.config.MaxRooms)
+	}
+
 	// ตรวจสอบว่าห้องมีอยู่แล้วหรือไม่
 	if _, exists := rm.rooms[name]; exists {
 		return nil, fmt.Errorf("room '%s' already exists", name)
@@ -461,12 +681,13 @@ func (rm *RoomManager) CreateRoom(name, creatorUsername string) (*Room, error) {
 		Users:     make(map[string]*User),
 		CreatedAt: time.Now(),
 		CreatedBy: creatorUsername,
-		MaxUsers:  50, // จำกัด 50 คนต่อห้อง
+		MaxUsers:  resourceManager.config.MaxUsersPerRoom,
 		IsActive:  true,
 	}
 
 	rm.rooms[name] = room
-	log.Printf("🏠 Room '%s' created by %s", name, creatorUsername)
+	resourceManager.metrics.IncrementRooms()
+	log.Printf("🏠 Room '%s' created by %s (%d/%d rooms)", name, creatorUsername, resourceManager.metrics.TotalRooms, resourceManager.config.MaxRooms)
 	return room, nil
 }
 
@@ -619,6 +840,7 @@ func (um *UserManager) RegisterUser(connID, username string) (*User, error) {
 	um.usersByName[username] = user
 
 	log.Printf("👤 User registered: %s (ConnID: %s)", username, connID)
+	resourceManager.metrics.IncrementUsers()
 	return user, nil
 }
 
@@ -697,15 +919,17 @@ type ConnectionManager struct {
 	broadcast   chan *BroadcastMessage
 	register    chan *Connection
 	unregister  chan *Connection
+	config      *ServerConfig
 }
 
 // NewConnectionManager creates a new connection manager
-func NewConnectionManager() *ConnectionManager {
+func NewConnectionManager(config *ServerConfig) *ConnectionManager {
 	return &ConnectionManager{
 		connections: make(map[string]*Connection),
-		broadcast:   make(chan *BroadcastMessage, 256),
+		broadcast:   make(chan *BroadcastMessage, config.BroadcastBuffer),
 		register:    make(chan *Connection),
 		unregister:  make(chan *Connection),
+		config:      config,
 	}
 }
 
@@ -730,8 +954,18 @@ func (cm *ConnectionManager) registerConnection(conn *Connection) {
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
 
+	// ตรวจสอบ resource limits
+	if !resourceManager.CanAcceptConnection() {
+		log.Printf("❌ Connection limit reached, rejecting: %s", conn.ID)
+		conn.Conn.WriteMessage(websocket.TextMessage, []byte("❌ เซิร์ฟเวอร์เต็ม กรุณาลองใหม่ภายหลัง"))
+		conn.Conn.Close()
+		return
+	}
+
 	cm.connections[conn.ID] = conn
-	log.Printf("📝 Connection registered: %s (Total: %d)", conn.ID, len(cm.connections))
+	resourceManager.metrics.IncrementConnections()
+	
+	log.Printf("📝 Connection registered: %s (Total: %d/%d)", conn.ID, len(cm.connections), cm.config.MaxConnections)
 
 	// ส่งข้อความขอ username
 	authMsg := &Message{
@@ -747,6 +981,7 @@ func (cm *ConnectionManager) registerConnection(conn *Connection) {
 	default:
 		close(conn.Send)
 		delete(cm.connections, conn.ID)
+		resourceManager.metrics.DecrementConnections()
 	}
 }
 
@@ -780,11 +1015,13 @@ func (cm *ConnectionManager) unregisterConnection(conn *Connection) {
 
 			// ลบ user จาก user manager
 			userManager.UnregisterUser(conn.ID)
+			resourceManager.metrics.DecrementUsers()
 		}
 
 		delete(cm.connections, conn.ID)
 		close(conn.Send)
-		log.Printf("🗑️ Connection unregistered: %s (Total: %d)", conn.ID, len(cm.connections))
+		resourceManager.metrics.DecrementConnections()
+		log.Printf("🗑️ Connection unregistered: %s (Total: %d/%d)", conn.ID, len(cm.connections), cm.config.MaxConnections)
 	}
 }
 
@@ -826,8 +1063,14 @@ func (cm *ConnectionManager) broadcastMessage(broadcastMsg *BroadcastMessage) {
 			// Connection ไม่ตอบสนอง ลบออก
 			close(conn.Send)
 			delete(cm.connections, connID)
+			resourceManager.metrics.DecrementConnections()
 			log.Printf("🔌 Removed unresponsive connection: %s", connID)
 		}
+	}
+
+	// นับ message metrics
+	if message.Type == "text" {
+		resourceManager.metrics.IncrementMessages()
 	}
 
 	if roomName != "" {
@@ -914,7 +1157,85 @@ func randomString(length int) string {
 	return string(b)
 }
 
-// WebSocket upgrader สำหรับ upgrade HTTP connection เป็น WebSocket
+// GracefulShutdown handles graceful server shutdown
+type GracefulShutdown struct {
+	server *http.Server
+	done   chan bool
+}
+
+// NewGracefulShutdown creates a new graceful shutdown handler
+func NewGracefulShutdown(server *http.Server) *GracefulShutdown {
+	return &GracefulShutdown{
+		server: server,
+		done:   make(chan bool, 1),
+	}
+}
+
+// Start starts the graceful shutdown handler
+func (gs *GracefulShutdown) Start() {
+	// สร้าง channel สำหรับรับ OS signals
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		// รอ signal
+		sig := <-sigChan
+		log.Printf("🛑 Received signal: %v", sig)
+		log.Println("🔄 Starting graceful shutdown...")
+
+		// แสดง metrics สุดท้าย
+		resourceManager.LogMetrics()
+
+		// ปิด connections ทั้งหมด
+		gs.closeAllConnections()
+
+		// สร้าง context สำหรับ shutdown timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		// ปิด HTTP server
+		if err := gs.server.Shutdown(ctx); err != nil {
+			log.Printf("❌ Server shutdown error: %v", err)
+		} else {
+			log.Println("✅ Server shutdown completed")
+		}
+
+		gs.done <- true
+	}()
+}
+
+// Wait waits for graceful shutdown to complete
+func (gs *GracefulShutdown) Wait() {
+	<-gs.done
+}
+
+// closeAllConnections closes all WebSocket connections gracefully
+func (gs *GracefulShutdown) closeAllConnections() {
+	connectionManager.mutex.Lock()
+	defer connectionManager.mutex.Unlock()
+
+	log.Printf("🔌 Closing %d active connections...", len(connectionManager.connections))
+
+	for connID, conn := range connectionManager.connections {
+		// ส่งข้อความแจ้งเตือนการปิดเซิร์ฟเวอร์
+		shutdownMsg := "🛑 เซิร์ฟเวอร์กำลังปิดตัว ขอบคุณที่ใช้บริการ"
+		select {
+		case conn.Send <- []byte(shutdownMsg):
+		default:
+		}
+
+		// ปิด connection
+		conn.Conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "Server shutdown"))
+		conn.Conn.Close()
+		close(conn.Send)
+
+		log.Printf("🔌 Closed connection: %s", connID)
+	}
+
+	// ล้าง connections map
+	connectionManager.connections = make(map[string]*Connection)
+	log.Println("✅ All connections closed")
+}
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		// อนุญาตให้ทุก origin เชื่อมต่อได้ (สำหรับการพัฒนา)
@@ -922,11 +1243,12 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-// Global connection manager, user manager, room manager, and command handler
+// Global connection manager, user manager, room manager, command handler, and resource manager
 var connectionManager *ConnectionManager
 var userManager *UserManager
 var roomManager *RoomManager
 var commandHandler *CommandHandler
+var resourceManager *ResourceManager
 
 // handleWebSocket จัดการ WebSocket connections
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -956,9 +1278,9 @@ func handleRead(conn *websocket.Conn, connID, clientAddr string) {
 	}()
 
 	// ตั้งค่า read deadline
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(resourceManager.config.ReadTimeout))
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(resourceManager.config.ReadTimeout))
 		return nil
 	})
 
@@ -1088,7 +1410,7 @@ func sendErrorMessage(conn *Connection, message string) {
 
 // handleWrite จัดการการเขียนข้อความไปยัง client
 func handleWrite(conn *websocket.Conn, connID, clientAddr string) {
-	ticker := time.NewTicker(54 * time.Second)
+	ticker := time.NewTicker(resourceManager.config.HeartbeatInterval)
 	defer func() {
 		ticker.Stop()
 		conn.Close()
@@ -1104,7 +1426,7 @@ func handleWrite(conn *websocket.Conn, connID, clientAddr string) {
 	for {
 		select {
 		case message, ok := <-connection.Send:
-			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			conn.SetWriteDeadline(time.Now().Add(resourceManager.config.WriteTimeout))
 			if !ok {
 				// Channel ถูกปิด
 				conn.WriteMessage(websocket.CloseMessage, []byte{})
@@ -1119,7 +1441,7 @@ func handleWrite(conn *websocket.Conn, connID, clientAddr string) {
 
 		case <-ticker.C:
 			// ส่ง ping เพื่อ keep connection alive
-			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			conn.SetWriteDeadline(time.Now().Add(resourceManager.config.WriteTimeout))
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				log.Printf("❌ Failed to send ping to %s: %v", clientAddr, err)
 				return
@@ -1129,14 +1451,30 @@ func handleWrite(conn *websocket.Conn, connID, clientAddr string) {
 }
 
 func main() {
+	// สร้าง configuration และ resource manager
+	config := DefaultServerConfig()
+	resourceManager = NewResourceManager(config)
+	
 	// สร้าง managers
-	connectionManager = NewConnectionManager()
+	connectionManager = NewConnectionManager(config)
 	userManager = NewUserManager()
 	roomManager = NewRoomManager()
 	commandHandler = NewCommandHandler()
 
 	// เริ่ม connection manager ใน goroutine
 	go connectionManager.Run()
+	
+	// เริ่ม metrics logging goroutine
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				resourceManager.LogMetrics()
+			}
+		}
+	}()
 
 	// ตั้งค่า HTTP routes
 	http.HandleFunc("/ws", handleWebSocket)
@@ -1146,16 +1484,36 @@ func main() {
 
 	// เริ่มต้น server
 	port := ":9090"
+	
+	// สร้าง HTTP server
+	server := &http.Server{
+		Addr:         port,
+		ReadTimeout:  config.ReadTimeout,
+		WriteTimeout: config.WriteTimeout,
+	}
+
+	// ตั้งค่า graceful shutdown
+	gracefulShutdown := NewGracefulShutdown(server)
+	gracefulShutdown.Start()
 	log.Printf("� Startingt WebSocket Chat Server on port %s", port)
 	log.Printf("📡 WebSocket endpoint: ws://localhost%s/ws", port)
 	log.Printf("🌐 Test page: http://localhost%s", port)
-	log.Printf("👥 Connection Manager: Ready")
+	log.Printf("👥 Connection Manager: Ready (Max: %d)", config.MaxConnections)
 	log.Printf("🔐 User Manager: Ready")
-	log.Printf("🏠 Room Manager: Ready")
+	log.Printf("🏠 Room Manager: Ready (Max: %d)", config.MaxRooms)
 	log.Printf("📋 Command Handler: Ready")
+	log.Printf("📊 Resource Manager: Ready")
+	log.Printf("⚙️  Configuration: Heartbeat=%v, ReadTimeout=%v, WriteTimeout=%v", 
+		config.HeartbeatInterval, config.ReadTimeout, config.WriteTimeout)
 
-	err := http.ListenAndServe(port, nil)
-	if err != nil {
-		log.Fatal("Server failed to start:", err)
+	log.Println("🛑 Press Ctrl+C for graceful shutdown")
+
+	// เริ่ม server
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("❌ Server failed to start: %v", err)
 	}
+
+	// รอ graceful shutdown เสร็จ
+	gracefulShutdown.Wait()
+	log.Println("👋 Server stopped gracefully")
 }

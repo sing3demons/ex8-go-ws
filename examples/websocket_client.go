@@ -15,8 +15,8 @@ func main() {
 	fmt.Println("🚀 เริ่มต้น WebSocket Client...")
 	
 	// เชื่อมต่อไปยัง WebSocket server
-	fmt.Println("🔗 กำลังเชื่อมต่อไปยัง ws://localhost:8080/ws...")
-	conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8080/ws", nil)
+	fmt.Println("🔗 กำลังเชื่อมต่อไปยัง ws://localhost:8082/ws...")
+	conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8082/ws", nil)
 	if err != nil {
 		log.Fatal("❌ เชื่อมต่อไม่ได้:", err)
 	}

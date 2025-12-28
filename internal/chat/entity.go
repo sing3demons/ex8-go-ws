@@ -15,6 +15,21 @@ type User struct {
 	IsAuthenticated bool      `json:"is_authenticated"`
 }
 
+// GetIsAuthenticated returns the authentication status
+func (u *User) GetIsAuthenticated() bool {
+	return u.IsAuthenticated
+}
+
+// GetUsername returns the username
+func (u *User) GetUsername() string {
+	return u.Username
+}
+
+// GetCurrentRoom returns the current room
+func (u *User) GetCurrentRoom() string {
+	return u.CurrentRoom
+}
+
 // Room represents a chat room
 type Room struct {
 	Name      string            `json:"name"`
@@ -32,6 +47,31 @@ type Message struct {
 	Sender    string    `json:"sender"`
 	Username  string    `json:"username"`
 	Timestamp time.Time `json:"timestamp"`
+}
+
+// GetType returns the message type
+func (m *Message) GetType() string {
+	return m.Type
+}
+
+// GetContent returns the message content
+func (m *Message) GetContent() string {
+	return m.Content
+}
+
+// GetSender returns the message sender
+func (m *Message) GetSender() string {
+	return m.Sender
+}
+
+// GetUsername returns the message username
+func (m *Message) GetUsername() string {
+	return m.Username
+}
+
+// GetTimestamp returns the message timestamp
+func (m *Message) GetTimestamp() time.Time {
+	return m.Timestamp
 }
 
 // BroadcastMessage represents a message with exclusion info
@@ -52,8 +92,8 @@ type Command struct {
 // Connection interface for WebSocket connections
 type Connection interface {
 	GetID() string
-	GetUser() *User
-	SetUser(user *User)
-	Send(message []byte) error
+	GetUser() interface{}
+	SetUser(user interface{})
+	SendMessage(message []byte) error
 	Close() error
 }

@@ -171,7 +171,13 @@
             };
 
             ws.onmessage = function(event) {
-                addMessage(`📨 ${event.data}`, 'received');
+                // ตรวจสอบว่าเป็นข้อความจากระบบหรือจาก user อื่น
+                const message = event.data;
+                if (message.startsWith('ยินดีต้อนรับ')) {
+                    addMessage(`🎉 ${message}`, 'system');
+                } else {
+                    addMessage(`👤 ${message}`, 'received');
+                }
             };
 
             ws.onclose = function(event) {

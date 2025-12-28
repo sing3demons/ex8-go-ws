@@ -57,7 +57,368 @@ type BroadcastMessage struct {
 	RoomName  string // ชื่อห้องที่จะส่งข้อความ (ถ้าว่างจะส่งให้ทุกคน)
 }
 
-// RoomManager manages chat rooms
+// Command represents a chat command
+type Command struct {
+	Name        string
+	Description string
+	Usage       string
+	Handler     func(*Connection, []string) error
+}
+
+// CommandHandler manages chat commands
+type CommandHandler struct {
+	commands map[string]*Command
+	mutex    sync.RWMutex
+}
+
+// NewCommandHandler creates a new command handler
+func NewCommandHandler() *CommandHandler {
+	ch := &CommandHandler{
+		commands: make(map[string]*Command),
+	}
+	
+	// ลงทะเบียนคำสั่งพื้นฐาน
+	ch.registerBuiltinCommands()
+	
+	return ch
+}
+
+// registerBuiltinCommands registers built-in commands
+func (ch *CommandHandler) registerBuiltinCommands() {
+	// คำสั่ง /help
+	ch.RegisterCommand(&Command{
+		Name:        "help",
+		Description: "แสดงรายการคำสั่งที่ใช้ได้",
+		Usage:       "/help",
+		Handler:     ch.handleHelp,
+	})
+	
+	// คำสั่ง /users
+	ch.RegisterCommand(&Command{
+		Name:        "users",
+		Description: "แสดงรายชื่อผู้ใช้ในห้องปัจจุบัน",
+		Usage:       "/users",
+		Handler:     ch.handleUsers,
+	})
+	
+	// คำสั่ง /rooms
+	ch.RegisterCommand(&Command{
+		Name:        "rooms",
+		Description: "แสดงรายการห้องทั้งหมด",
+		Usage:       "/rooms",
+		Handler:     ch.handleRooms,
+	})
+	
+	// คำสั่ง /join
+	ch.RegisterCommand(&Command{
+		Name:        "join",
+		Description: "เข้าร่วมห้องที่ระบุ",
+		Usage:       "/join <room_name>",
+		Handler:     ch.handleJoin,
+	})
+	
+	// คำสั่ง /leave
+	ch.RegisterCommand(&Command{
+		Name:        "leave",
+		Description: "ออกจากห้องปัจจุบัน",
+		Usage:       "/leave",
+		Handler:     ch.handleLeave,
+	})
+	
+	// คำสั่ง /create
+	ch.RegisterCommand(&Command{
+		Name:        "create",
+		Description: "สร้างห้องใหม่",
+		Usage:       "/create <room_name>",
+		Handler:     ch.handleCreate,
+	})
+}
+
+// RegisterCommand registers a new command
+func (ch *CommandHandler) RegisterCommand(cmd *Command) {
+	ch.mutex.Lock()
+	defer ch.mutex.Unlock()
+	ch.commands[cmd.Name] = cmd
+	log.Printf("📋 Command registered: /%s", cmd.Name)
+}
+
+// ExecuteCommand executes a command
+func (ch *CommandHandler) ExecuteCommand(conn *Connection, message string) error {
+	// ตรวจสอบว่าเป็นคำสั่งหรือไม่
+	if !strings.HasPrefix(message, "/") {
+		return fmt.Errorf("not a command")
+	}
+	
+	// แยกคำสั่งและ arguments
+	parts := strings.Fields(message)
+	if len(parts) == 0 {
+		return fmt.Errorf("empty command")
+	}
+	
+	commandName := strings.TrimPrefix(parts[0], "/")
+	args := parts[1:]
+	
+	// หาคำสั่ง
+	ch.mutex.RLock()
+	cmd, exists := ch.commands[commandName]
+	ch.mutex.RUnlock()
+	
+	if !exists {
+		return fmt.Errorf("unknown command: /%s", commandName)
+	}
+	
+	// เรียกใช้คำสั่ง
+	log.Printf("🎯 Executing command: /%s by %s", commandName, conn.User.Username)
+	return cmd.Handler(conn, args)
+}
+
+// GetCommands returns all available commands
+func (ch *CommandHandler) GetCommands() map[string]*Command {
+	ch.mutex.RLock()
+	defer ch.mutex.RUnlock()
+	
+	commands := make(map[string]*Command)
+	for name, cmd := range ch.commands {
+		commands[name] = cmd
+	}
+	return commands
+}
+
+// Command handlers
+
+// handleHelp shows available commands
+func (ch *CommandHandler) handleHelp(conn *Connection, args []string) error {
+	commands := ch.GetCommands()
+	
+	helpText := "📋 คำสั่งที่ใช้ได้:\n"
+	helpText += "==================\n"
+	
+	for _, cmd := range commands {
+		helpText += fmt.Sprintf("• %s - %s\n", cmd.Usage, cmd.Description)
+	}
+	
+	sendSystemMessage(conn, helpText)
+	return nil
+}
+
+// handleUsers shows users in current room
+func (ch *CommandHandler) handleUsers(conn *Connection, args []string) error {
+	if conn.User.CurrentRoom == "" {
+		sendErrorMessage(conn, "❌ คุณไม่ได้อยู่ในห้องใดๆ")
+		return nil
+	}
+	
+	users := roomManager.GetUsersInRoom(conn.User.CurrentRoom)
+	
+	userText := fmt.Sprintf("👥 ผู้ใช้ในห้อง '%s' (%d คน):\n", conn.User.CurrentRoom, len(users))
+	userText += "========================\n"
+	
+	for _, user := range users {
+		status := "🟢"
+		if time.Since(user.LastActive) > 5*time.Minute {
+			status = "🟡"
+		}
+		userText += fmt.Sprintf("• %s %s\n", status, user.Username)
+	}
+	
+	sendSystemMessage(conn, userText)
+	return nil
+}
+
+// handleRooms shows all available rooms
+func (ch *CommandHandler) handleRooms(conn *Connection, args []string) error {
+	rooms := roomManager.GetRooms()
+	
+	roomText := fmt.Sprintf("🏠 ห้องทั้งหมด (%d ห้อง):\n", len(rooms))
+	roomText += "==================\n"
+	
+	for _, room := range rooms {
+		userCount := len(room.Users)
+		currentRoom := ""
+		if conn.User.CurrentRoom == room.Name {
+			currentRoom = " (ปัจจุบัน)"
+		}
+		roomText += fmt.Sprintf("• %s - %d/%d คน%s\n", room.Name, userCount, room.MaxUsers, currentRoom)
+	}
+	
+	sendSystemMessage(conn, roomText)
+	return nil
+}
+
+// handleJoin joins a room
+func (ch *CommandHandler) handleJoin(conn *Connection, args []string) error {
+	if len(args) == 0 {
+		sendErrorMessage(conn, "❌ กรุณาระบุชื่อห้อง: /join <room_name>")
+		return nil
+	}
+	
+	roomName := args[0]
+	
+	// ตรวจสอบว่าอยู่ในห้องเดียวกันอยู่แล้วหรือไม่
+	if conn.User.CurrentRoom == roomName {
+		sendErrorMessage(conn, fmt.Sprintf("❌ คุณอยู่ในห้อง '%s' อยู่แล้ว", roomName))
+		return nil
+	}
+	
+	// ตรวจสอบว่าห้องมีอยู่หรือไม่
+	_, exists := roomManager.GetRoom(roomName)
+	if !exists {
+		sendErrorMessage(conn, fmt.Sprintf("❌ ไม่พบห้อง '%s' ใช้ /create %s เพื่อสร้างห้องใหม่", roomName, roomName))
+		return nil
+	}
+	
+	// ออกจากห้องเก่า
+	oldRoom := conn.User.CurrentRoom
+	if oldRoom != "" {
+		// แจ้งคนในห้องเก่าว่ามีคนออก
+		leaveMsg := &Message{
+			Type:      "user_left_room",
+			Content:   fmt.Sprintf("👋 %s ออกจากห้อง '%s' แล้ว", conn.User.Username, oldRoom),
+			Sender:    "System",
+			Username:  "System",
+			Timestamp: time.Now(),
+		}
+		connectionManager.BroadcastToRoom(leaveMsg, conn.ID, oldRoom)
+	}
+	
+	// เข้าห้องใหม่
+	err := roomManager.JoinRoom(conn.User, roomName)
+	if err != nil {
+		sendErrorMessage(conn, fmt.Sprintf("❌ ไม่สามารถเข้าห้อง '%s': %s", roomName, err.Error()))
+		return nil
+	}
+	
+	// ส่งข้อความยืนยัน
+	sendSystemMessage(conn, fmt.Sprintf("✅ เข้าร่วมห้อง '%s' เรียบร้อยแล้ว", roomName))
+	
+	// แจ้งคนในห้องใหม่ว่ามีคนเข้ามา
+	joinMsg := &Message{
+		Type:      "user_joined_room",
+		Content:   fmt.Sprintf("👋 %s เข้าร่วมห้อง '%s' แล้ว", conn.User.Username, roomName),
+		Sender:    "System",
+		Username:  "System",
+		Timestamp: time.Now(),
+	}
+	connectionManager.BroadcastToRoom(joinMsg, conn.ID, roomName)
+	
+	return nil
+}
+
+// handleLeave leaves current room
+func (ch *CommandHandler) handleLeave(conn *Connection, args []string) error {
+	if conn.User.CurrentRoom == "" {
+		sendErrorMessage(conn, "❌ คุณไม่ได้อยู่ในห้องใดๆ")
+		return nil
+	}
+	
+	if conn.User.CurrentRoom == "general" {
+		sendErrorMessage(conn, "❌ ไม่สามารถออกจากห้อง 'general' ได้ ใช้ /join <room> เพื่อย้ายไปห้องอื่น")
+		return nil
+	}
+	
+	oldRoom := conn.User.CurrentRoom
+	
+	// ออกจากห้องปัจจุบัน
+	err := roomManager.LeaveRoom(conn.User, oldRoom)
+	if err != nil {
+		sendErrorMessage(conn, fmt.Sprintf("❌ ไม่สามารถออกจากห้อง: %s", err.Error()))
+		return nil
+	}
+	
+	// เข้าห้อง general อัตโนมัติ
+	err = roomManager.JoinRoom(conn.User, "general")
+	if err != nil {
+		log.Printf("❌ Failed to auto-join general room: %v", err)
+	}
+	
+	// ส่งข้อความยืนยัน
+	sendSystemMessage(conn, fmt.Sprintf("✅ ออกจากห้อง '%s' และกลับไปห้อง 'general' แล้ว", oldRoom))
+	
+	// แจ้งคนในห้องเก่าว่ามีคนออก
+	leaveMsg := &Message{
+		Type:      "user_left_room",
+		Content:   fmt.Sprintf("👋 %s ออกจากห้อง '%s' แล้ว", conn.User.Username, oldRoom),
+		Sender:    "System",
+		Username:  "System",
+		Timestamp: time.Now(),
+	}
+	connectionManager.BroadcastToRoom(leaveMsg, conn.ID, oldRoom)
+	
+	// แจ้งคนในห้อง general ว่ามีคนเข้ามา
+	joinMsg := &Message{
+		Type:      "user_joined_room",
+		Content:   fmt.Sprintf("👋 %s กลับมาห้อง 'general' แล้ว", conn.User.Username),
+		Sender:    "System",
+		Username:  "System",
+		Timestamp: time.Now(),
+	}
+	connectionManager.BroadcastToRoom(joinMsg, conn.ID, "general")
+	
+	return nil
+}
+
+// handleCreate creates a new room
+func (ch *CommandHandler) handleCreate(conn *Connection, args []string) error {
+	if len(args) == 0 {
+		sendErrorMessage(conn, "❌ กรุณาระบุชื่อห้อง: /create <room_name>")
+		return nil
+	}
+	
+	roomName := args[0]
+	
+	// ตรวจสอบชื่อห้อง
+	if roomName == "" || len(roomName) < 2 {
+		sendErrorMessage(conn, "❌ ชื่อห้องต้องมีอย่างน้อย 2 ตัวอักษร")
+		return nil
+	}
+	
+	if strings.Contains(roomName, " ") {
+		sendErrorMessage(conn, "❌ ชื่อห้องไม่สามารถมีช่องว่างได้")
+		return nil
+	}
+	
+	// สร้างห้องใหม่
+	_, err := roomManager.CreateRoom(roomName, conn.User.Username)
+	if err != nil {
+		sendErrorMessage(conn, fmt.Sprintf("❌ ไม่สามารถสร้างห้อง '%s': %s", roomName, err.Error()))
+		return nil
+	}
+	
+	// เข้าห้องที่สร้างใหม่อัตโนมัติ
+	oldRoom := conn.User.CurrentRoom
+	err = roomManager.JoinRoom(conn.User, roomName)
+	if err != nil {
+		sendErrorMessage(conn, fmt.Sprintf("❌ สร้างห้องสำเร็จแต่ไม่สามารถเข้าห้องได้: %s", err.Error()))
+		return nil
+	}
+	
+	// ส่งข้อความยืนยัน
+	sendSystemMessage(conn, fmt.Sprintf("✅ สร้างห้อง '%s' และเข้าร่วมเรียบร้อยแล้ว", roomName))
+	
+	// แจ้งคนในห้องเก่าว่ามีคนออก
+	if oldRoom != "" {
+		leaveMsg := &Message{
+			Type:      "user_left_room",
+			Content:   fmt.Sprintf("👋 %s ออกจากห้อง '%s' เพื่อสร้างห้องใหม่", conn.User.Username, oldRoom),
+			Sender:    "System",
+			Username:  "System",
+			Timestamp: time.Now(),
+		}
+		connectionManager.BroadcastToRoom(leaveMsg, conn.ID, oldRoom)
+	}
+	
+	// แจ้งทุกคนว่ามีห้องใหม่
+	announceMsg := &Message{
+		Type:      "room_created",
+		Content:   fmt.Sprintf("🏠 %s สร้างห้อง '%s' ใหม่แล้ว ใช้ /join %s เพื่อเข้าร่วม", conn.User.Username, roomName, roomName),
+		Sender:    "System",
+		Username:  "System",
+		Timestamp: time.Now(),
+	}
+	connectionManager.BroadcastMessage(announceMsg, conn.ID)
+	
+	return nil
+}
 type RoomManager struct {
 	rooms map[string]*Room
 	mutex sync.RWMutex
@@ -561,10 +922,11 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-// Global connection manager, user manager, and room manager
+// Global connection manager, user manager, room manager, and command handler
 var connectionManager *ConnectionManager
 var userManager *UserManager
 var roomManager *RoomManager
+var commandHandler *CommandHandler
 
 // handleWebSocket จัดการ WebSocket connections
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -665,6 +1027,32 @@ func handleRead(conn *websocket.Conn, connID, clientAddr string) {
 			// User authenticated แล้ว - ประมวลผลข้อความปกติ
 			userManager.UpdateLastActive(connID)
 
+			// ตรวจสอบว่าเป็นคำสั่งหรือไม่
+			if strings.HasPrefix(messageContent, "/") {
+				// ประมวลผลคำสั่ง
+				err := commandHandler.ExecuteCommand(connection, messageContent)
+				if err != nil {
+					if err.Error() == "not a command" {
+						// ไม่ใช่คำสั่ง ประมวลผลเป็นข้อความธรรมดา
+					} else if strings.HasPrefix(err.Error(), "unknown command:") {
+						sendErrorMessage(connection, fmt.Sprintf("❌ %s ใช้ /help เพื่อดูคำสั่งที่ใช้ได้", err.Error()))
+						continue
+					} else {
+						sendErrorMessage(connection, fmt.Sprintf("❌ เกิดข้อผิดพลาด: %s", err.Error()))
+						continue
+					}
+				} else {
+					// คำสั่งทำงานสำเร็จ
+					continue
+				}
+			}
+
+			// ตรวจสอบว่าผู้ใช้อยู่ในห้องหรือไม่
+			if connection.User.CurrentRoom == "" {
+				sendErrorMessage(connection, "❌ คุณต้องอยู่ในห้องก่อนจึงจะส่งข้อความได้ ใช้ /join <room> เพื่อเข้าห้อง")
+				continue
+			}
+
 			// สร้าง message object พร้อม username
 			message := &Message{
 				Type:      "text",
@@ -745,6 +1133,7 @@ func main() {
 	connectionManager = NewConnectionManager()
 	userManager = NewUserManager()
 	roomManager = NewRoomManager()
+	commandHandler = NewCommandHandler()
 
 	// เริ่ม connection manager ใน goroutine
 	go connectionManager.Run()
@@ -763,6 +1152,7 @@ func main() {
 	log.Printf("👥 Connection Manager: Ready")
 	log.Printf("🔐 User Manager: Ready")
 	log.Printf("🏠 Room Manager: Ready")
+	log.Printf("📋 Command Handler: Ready")
 
 	err := http.ListenAndServe(port, nil)
 	if err != nil {

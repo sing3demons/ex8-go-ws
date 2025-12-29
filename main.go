@@ -12,19 +12,23 @@ import (
 	"realtime-chat/internal/chat"
 	"realtime-chat/internal/config"
 	"realtime-chat/internal/database"
+	"realtime-chat/internal/message"
+	"realtime-chat/internal/room"
+	"realtime-chat/internal/user"
+	userPkg "realtime-chat/internal/user"
 	wsocket "realtime-chat/internal/websocket"
 
 	"github.com/gorilla/websocket"
 )
 
-// roomServiceAdapter adapts chat.RoomService to websocket.RoomService
-type roomServiceAdapter struct {
-	chatRoomService chat.RoomService
+// wsRoomServiceAdapter adapts room.Service to websocket.RoomService
+type wsRoomServiceAdapter struct {
+	roomService room.Service
 }
 
-func (r *roomServiceAdapter) LeaveRoom(user interface{}, roomName string) error {
-	if chatUser, ok := user.(*chat.User); ok {
-		return r.chatRoomService.LeaveRoom(chatUser, roomName)
+func (r *wsRoomServiceAdapter) LeaveRoom(user interface{}, roomName string) error {
+	if chatUser, ok := user.(*userPkg.User); ok {
+		return r.roomService.LeaveRoom(chatUser, roomName)
 	}
 	return nil
 }
@@ -34,8 +38,11 @@ type wsManagerAdapter struct {
 	wsManager *wsocket.Manager
 }
 
-func (w *wsManagerAdapter) AddConnection(conn *websocket.Conn) string {
-	return w.wsManager.AddConnection(conn)
+func (w *wsManagerAdapter) AddConnection(conn interface{}) string {
+	if wsConn, ok := conn.(*websocket.Conn); ok {
+		return w.wsManager.AddConnection(wsConn)
+	}
+	return ""
 }
 
 func (w *wsManagerAdapter) RemoveConnection(connID string) {
@@ -55,8 +62,9 @@ func (w *wsManagerAdapter) BroadcastToRoom(message interface{}, excludeID, roomN
 	w.wsManager.BroadcastToRoom(message, excludeID, roomName)
 }
 
-func (w *wsManagerAdapter) GetConnectionHealth(connID string) (*config.ConnectionHealth, bool) {
-	return w.wsManager.GetConnectionHealth(connID)
+func (w *wsManagerAdapter) GetConnectionHealth(connID string) (interface{}, bool) {
+	health, exists := w.wsManager.GetConnectionHealth(connID)
+	return health, exists
 }
 
 func main() {
@@ -76,14 +84,14 @@ func main() {
 	metrics := config.NewServerMetrics()
 
 	// สร้าง repositories
-	var userRepo chat.UserRepository
-	var roomRepo chat.RoomRepository
-	var messageRepo *database.MongoMessageRepository
+	var userRepo user.Repository
+	var roomRepo room.Repository
+	var messageRepo message.Repository
 	var mongoDB *database.MongoDB
 
 	if cfg.EnableMongoDB {
 		log.Println("🔄 Initializing MongoDB connection...")
-		
+
 		// สร้าง MongoDB configuration
 		mongoConfig := &database.MongoConfig{
 			URI:            cfg.MongoURI,
@@ -108,12 +116,9 @@ func main() {
 			}
 
 			// สร้าง MongoDB repositories
-			mongoUserRepo := database.NewMongoUserRepository(mongoDB)
-			mongoRoomRepo := database.NewMongoRoomRepository(mongoDB, mongoUserRepo)
-			messageRepo = database.NewMongoMessageRepository(mongoDB)
-
-			userRepo = mongoUserRepo
-			roomRepo = mongoRoomRepo
+			userRepo = user.NewMongoRepository(mongoDB)
+			roomRepo = room.NewMongoRepository(mongoDB)
+			messageRepo = message.NewMongoRepository(mongoDB)
 
 			log.Println("✅ MongoDB repositories initialized")
 		}
@@ -122,16 +127,17 @@ func main() {
 	// ถ้าไม่ใช้ MongoDB หรือเชื่อมต่อไม่ได้ ให้ใช้ in-memory repositories
 	if !cfg.EnableMongoDB {
 		log.Println("🔄 Using in-memory repositories")
-		userRepo = chat.NewInMemoryUserRepository()
-		roomRepo = chat.NewInMemoryRoomRepository()
+		userRepo = user.NewInMemoryRepository()
+		roomRepo = room.NewInMemoryRepository()
 	}
 
 	// สร้าง services
-	userService := chat.NewUserService(userRepo, metrics)
-	roomService := chat.NewRoomService(roomRepo, cfg.MaxRooms, cfg.MaxUsersPerRoom, metrics)
+	userService := user.NewService(userRepo, metrics)
+	roomService := room.NewService(roomRepo, cfg.MaxRooms, cfg.MaxUsersPerRoom, metrics)
 
 	// สร้าง WebSocket manager
-	wsManager := wsocket.NewManager(cfg, userService, &roomServiceAdapter{roomService}, metrics)
+	wsRoomAdapter := &wsRoomServiceAdapter{roomService}
+	wsManager := wsocket.NewManager(cfg, userService, wsRoomAdapter, metrics)
 
 	// สร้าง adapter สำหรับ WebSocket manager
 	wsManagerAdapted := &wsManagerAdapter{wsManager}
@@ -218,13 +224,13 @@ func main() {
 	log.Printf("🏠 Room Manager: Ready (Max: %d)", cfg.MaxRooms)
 	log.Printf("📋 Command Handler: Ready")
 	log.Printf("📊 Message Service: Ready")
-	
+
 	if cfg.EnableMongoDB && mongoDB != nil {
 		log.Printf("🗄️  Database: MongoDB (%s/%s)", cfg.MongoURI, cfg.MongoDatabase)
 	} else {
 		log.Printf("🗄️  Database: In-Memory")
 	}
-	
+
 	log.Printf("⚙️  Configuration: Heartbeat=%v, ReadTimeout=%v, WriteTimeout=%v",
 		cfg.HeartbeatInterval, cfg.ReadTimeout, cfg.WriteTimeout)
 

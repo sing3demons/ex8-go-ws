@@ -1,4 +1,4 @@
-package database
+package room
 
 import (
 	"context"
@@ -6,28 +6,79 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
-	"realtime-chat/internal/chat"
+	"realtime-chat/internal/database"
+	userPkg "realtime-chat/internal/user"
 )
 
-// MongoRoomRepository implements chat.RoomRepository using MongoDB
-type MongoRoomRepository struct {
-	collection     *mongo.Collection
-	userRepository *MongoUserRepository
+// UserDocument represents a user document in MongoDB (for room queries)
+type UserDocument struct {
+	ID              primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Username        string             `bson:"username" json:"username"`
+	ConnID          string             `bson:"conn_id" json:"conn_id"`
+	CurrentRoom     string             `bson:"current_room" json:"current_room"`
+	JoinedAt        time.Time          `bson:"joined_at" json:"joined_at"`
+	LastActive      time.Time          `bson:"last_active" json:"last_active"`
+	IsAuthenticated bool               `bson:"is_authenticated" json:"is_authenticated"`
+	CreatedAt       time.Time          `bson:"created_at" json:"created_at"`
+	UpdatedAt       time.Time          `bson:"updated_at" json:"updated_at"`
 }
 
-// NewMongoRoomRepository creates a new MongoDB room repository
-func NewMongoRoomRepository(db *MongoDB, userRepo *MongoUserRepository) *MongoRoomRepository {
-	return &MongoRoomRepository{
+// RoomDocument represents a room document in MongoDB
+type RoomDocument struct {
+	ID          primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Name        string             `bson:"name" json:"name"`
+	CreatedAt   time.Time          `bson:"created_at" json:"created_at"`
+	CreatedBy   string             `bson:"created_by" json:"created_by"`
+	MaxUsers    int                `bson:"max_users" json:"max_users"`
+	IsActive    bool               `bson:"is_active" json:"is_active"`
+	UserCount   int                `bson:"user_count" json:"user_count"`
+	LastMessage time.Time          `bson:"last_message" json:"last_message"`
+	UpdatedAt   time.Time          `bson:"updated_at" json:"updated_at"`
+}
+
+// ToRoom converts RoomDocument to Room entity
+func (doc *RoomDocument) ToRoom() *Room {
+	return &Room{
+		Name:      doc.Name,
+		Users:     make(map[string]*userPkg.User), // Will be populated separately
+		CreatedAt: doc.CreatedAt,
+		CreatedBy: doc.CreatedBy,
+		MaxUsers:  doc.MaxUsers,
+		IsActive:  doc.IsActive,
+	}
+}
+
+// FromRoom converts Room entity to RoomDocument
+func (doc *RoomDocument) FromRoom(room *Room) {
+	doc.Name = room.Name
+	doc.CreatedAt = room.CreatedAt
+	doc.CreatedBy = room.CreatedBy
+	doc.MaxUsers = room.MaxUsers
+	doc.IsActive = room.IsActive
+	doc.UserCount = len(room.Users)
+	doc.UpdatedAt = time.Now()
+}
+
+// MongoRepository implements Repository using MongoDB
+type MongoRepository struct {
+	collection     *mongo.Collection
+	userCollection *mongo.Collection
+}
+
+// NewMongoRepository creates a new MongoDB room repository
+func NewMongoRepository(db *database.MongoDB) Repository {
+	return &MongoRepository{
 		collection:     db.GetCollection("rooms"),
-		userRepository: userRepo,
+		userCollection: db.GetCollection("users"),
 	}
 }
 
 // Create creates a new room
-func (r *MongoRoomRepository) Create(name, creatorUsername string, maxUsers int) (*chat.Room, error) {
+func (r *MongoRepository) Create(name, creatorUsername string, maxUsers int) (*Room, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -53,10 +104,10 @@ func (r *MongoRoomRepository) Create(name, creatorUsername string, maxUsers int)
 		return nil, fmt.Errorf("failed to create room: %v", err)
 	}
 
-	// Convert to chat.Room
-	room := &chat.Room{
+	// Convert to room.Room
+	room := &Room{
 		Name:      name,
-		Users:     make(map[string]*chat.User),
+		Users:     make(map[string]*userPkg.User),
 		CreatedAt: now,
 		CreatedBy: creatorUsername,
 		MaxUsers:  maxUsers,
@@ -69,7 +120,7 @@ func (r *MongoRoomRepository) Create(name, creatorUsername string, maxUsers int)
 }
 
 // GetByName gets a room by name
-func (r *MongoRoomRepository) GetByName(name string) (*chat.Room, bool) {
+func (r *MongoRepository) GetByName(name string) (*Room, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -84,12 +135,12 @@ func (r *MongoRoomRepository) GetByName(name string) (*chat.Room, bool) {
 
 	// Get users in this room
 	users := r.getUsersInRoom(name)
-	userMap := make(map[string]*chat.User)
+	userMap := make(map[string]*userPkg.User)
 	for _, user := range users {
 		userMap[user.ConnID] = user
 	}
 
-	room := &chat.Room{
+	room := &Room{
 		Name:      roomDoc.Name,
 		Users:     userMap,
 		CreatedAt: roomDoc.CreatedAt,
@@ -102,17 +153,17 @@ func (r *MongoRoomRepository) GetByName(name string) (*chat.Room, bool) {
 }
 
 // GetActiveRooms returns all active rooms
-func (r *MongoRoomRepository) GetActiveRooms() []*chat.Room {
+func (r *MongoRepository) GetActiveRooms() []*Room {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	cursor, err := r.collection.Find(ctx, bson.M{"is_active": true}, options.Find().SetSort(bson.M{"created_at": -1}))
 	if err != nil {
-		return []*chat.Room{}
+		return []*Room{}
 	}
 	defer cursor.Close(ctx)
 
-	var rooms []*chat.Room
+	var rooms []*Room
 	for cursor.Next(ctx) {
 		var roomDoc RoomDocument
 		if err := cursor.Decode(&roomDoc); err != nil {
@@ -121,12 +172,12 @@ func (r *MongoRoomRepository) GetActiveRooms() []*chat.Room {
 
 		// Get users in this room
 		users := r.getUsersInRoom(roomDoc.Name)
-		userMap := make(map[string]*chat.User)
+		userMap := make(map[string]*userPkg.User)
 		for _, user := range users {
 			userMap[user.ConnID] = user
 		}
 
-		room := &chat.Room{
+		room := &Room{
 			Name:      roomDoc.Name,
 			Users:     userMap,
 			CreatedAt: roomDoc.CreatedAt,
@@ -141,17 +192,17 @@ func (r *MongoRoomRepository) GetActiveRooms() []*chat.Room {
 }
 
 // GetAll returns all rooms (active and inactive)
-func (r *MongoRoomRepository) GetAll() []*chat.Room {
+func (r *MongoRepository) GetAll() []*Room {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	cursor, err := r.collection.Find(ctx, bson.M{}, options.Find().SetSort(bson.M{"created_at": -1}))
 	if err != nil {
-		return []*chat.Room{}
+		return []*Room{}
 	}
 	defer cursor.Close(ctx)
 
-	var rooms []*chat.Room
+	var rooms []*Room
 	for cursor.Next(ctx) {
 		var roomDoc RoomDocument
 		if err := cursor.Decode(&roomDoc); err != nil {
@@ -160,12 +211,12 @@ func (r *MongoRoomRepository) GetAll() []*chat.Room {
 
 		// Get users in this room
 		users := r.getUsersInRoom(roomDoc.Name)
-		userMap := make(map[string]*chat.User)
+		userMap := make(map[string]*userPkg.User)
 		for _, user := range users {
 			userMap[user.ConnID] = user
 		}
 
-		room := &chat.Room{
+		room := &Room{
 			Name:      roomDoc.Name,
 			Users:     userMap,
 			CreatedAt: roomDoc.CreatedAt,
@@ -180,7 +231,7 @@ func (r *MongoRoomRepository) GetAll() []*chat.Room {
 }
 
 // JoinRoom adds a user to a room
-func (r *MongoRoomRepository) JoinRoom(user *chat.User, roomName string) error {
+func (r *MongoRepository) JoinRoom(user *userPkg.User, roomName string) error {
 	// First, ensure the room exists
 	room, exists := r.GetByName(roomName)
 	if !exists {
@@ -200,8 +251,8 @@ func (r *MongoRoomRepository) JoinRoom(user *chat.User, roomName string) error {
 		}
 	}
 
-	// Update user's current room
-	if err := r.userRepository.UpdateCurrentRoom(user.ConnID, roomName); err != nil {
+	// Update user's current room in database
+	if err := r.updateUserCurrentRoom(user.ConnID, roomName); err != nil {
 		return fmt.Errorf("failed to update user room: %v", err)
 	}
 
@@ -215,9 +266,9 @@ func (r *MongoRoomRepository) JoinRoom(user *chat.User, roomName string) error {
 }
 
 // LeaveRoom removes a user from a room
-func (r *MongoRoomRepository) LeaveRoom(user *chat.User, roomName string) error {
-	// Update user's current room to empty
-	if err := r.userRepository.UpdateCurrentRoom(user.ConnID, ""); err != nil {
+func (r *MongoRepository) LeaveRoom(user *userPkg.User, roomName string) error {
+	// Update user's current room to empty in database
+	if err := r.updateUserCurrentRoom(user.ConnID, ""); err != nil {
 		return fmt.Errorf("failed to update user room: %v", err)
 	}
 
@@ -231,12 +282,12 @@ func (r *MongoRoomRepository) LeaveRoom(user *chat.User, roomName string) error 
 }
 
 // GetUsersInRoom returns all users in a specific room
-func (r *MongoRoomRepository) GetUsersInRoom(roomName string) []*chat.User {
+func (r *MongoRepository) GetUsersInRoom(roomName string) []*userPkg.User {
 	return r.getUsersInRoom(roomName)
 }
 
 // GetRoomCount returns the number of active rooms
-func (r *MongoRoomRepository) GetRoomCount() int {
+func (r *MongoRepository) GetRoomCount() int {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -249,27 +300,27 @@ func (r *MongoRoomRepository) GetRoomCount() int {
 }
 
 // getUsersInRoom is a helper method to get users in a room
-func (r *MongoRoomRepository) getUsersInRoom(roomName string) []*chat.User {
+func (r *MongoRepository) getUsersInRoom(roomName string) []*userPkg.User {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	cursor, err := r.userRepository.collection.Find(ctx, bson.M{
+	cursor, err := r.userCollection.Find(ctx, bson.M{
 		"current_room":     roomName,
 		"is_authenticated": true,
 	})
 	if err != nil {
-		return []*chat.User{}
+		return []*userPkg.User{}
 	}
 	defer cursor.Close(ctx)
 
-	var users []*chat.User
+	var users []*userPkg.User
 	for cursor.Next(ctx) {
 		var userDoc UserDocument
 		if err := cursor.Decode(&userDoc); err != nil {
 			continue
 		}
 
-		user := &chat.User{
+		user := &userPkg.User{
 			ID:              userDoc.ID.Hex(),
 			Username:        userDoc.Username,
 			ConnID:          userDoc.ConnID,
@@ -284,13 +335,37 @@ func (r *MongoRoomRepository) getUsersInRoom(roomName string) []*chat.User {
 	return users
 }
 
+// updateUserCurrentRoom updates user's current room
+func (r *MongoRepository) updateUserCurrentRoom(connID, roomName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	update := bson.M{
+		"$set": bson.M{
+			"current_room": roomName,
+			"updated_at":   time.Now(),
+		},
+	}
+
+	result, err := r.userCollection.UpdateOne(ctx, bson.M{"conn_id": connID}, update)
+	if err != nil {
+		return fmt.Errorf("failed to update user room: %v", err)
+	}
+
+	if result.MatchedCount == 0 {
+		return fmt.Errorf("user not found")
+	}
+
+	return nil
+}
+
 // updateRoomUserCount updates the user count for a room
-func (r *MongoRoomRepository) updateRoomUserCount(roomName string) {
+func (r *MongoRepository) updateRoomUserCount(roomName string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	// Count users in the room
-	userCount, err := r.userRepository.collection.CountDocuments(ctx, bson.M{
+	userCount, err := r.userCollection.CountDocuments(ctx, bson.M{
 		"current_room":     roomName,
 		"is_authenticated": true,
 	})
@@ -311,7 +386,7 @@ func (r *MongoRoomRepository) updateRoomUserCount(roomName string) {
 }
 
 // DeactivateRoom deactivates a room
-func (r *MongoRoomRepository) DeactivateRoom(roomName string) error {
+func (r *MongoRepository) DeactivateRoom(roomName string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 

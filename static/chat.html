@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Realtime Chat System</title>
+    <link rel="stylesheet" href="styles.css">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="chat-container">
+        <!-- Header -->
+        <header class="chat-header">
+            <div class="header-left">
+                <h1><i class="fas fa-comments"></i> Realtime Chat</h1>
+                <div class="connection-status" id="connectionStatus">
+                    <i class="fas fa-circle"></i>
+                    <span id="statusText">Disconnected</span>
+                </div>
+            </div>
+            <div class="header-right">
+                <button class="btn btn-secondary" id="settingsBtn">
+                    <i class="fas fa-cog"></i>
+                </button>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <div class="chat-main">
+            <!-- Sidebar -->
+            <aside class="sidebar">
+                <!-- User Info -->
+                <div class="user-info" id="userInfo" style="display: none;">
+                    <div class="user-avatar">
+                        <i class="fas fa-user"></i>
+                    </div>
+                    <div class="user-details">
+                        <div class="username" id="currentUsername"></div>
+                        <div class="user-status">Online</div>
+                    </div>
+                </div>
+
+                <!-- Rooms Section -->
+                <div class="section">
+                    <div class="section-header">
+                        <h3><i class="fas fa-home"></i> Rooms</h3>
+                        <button class="btn btn-sm" id="createRoomBtn" title="Create Room">
+                            <i class="fas fa-plus"></i>
+                        </button>
+                    </div>
+                    <div class="rooms-list" id="roomsList">
+                        <!-- Rooms will be populated here -->
+                    </div>
+                </div>
+
+                <!-- Users Section -->
+                <div class="section">
+                    <div class="section-header">
+                        <h3><i class="fas fa-users"></i> Users in Room</h3>
+                    </div>
+                    <div class="users-list" id="usersList">
+                        <!-- Users will be populated here -->
+                    </div>
+                </div>
+            </aside>
+
+            <!-- Chat Area -->
+            <main class="chat-area">
+                <!-- Login Screen -->
+                <div class="login-screen" id="loginScreen">
+                    <div class="login-form">
+                        <h2><i class="fas fa-sign-in-alt"></i> Join Chat</h2>
+                        <div class="form-group">
+                            <label for="usernameInput">Username:</label>
+                            <input type="text" id="usernameInput" placeholder="Enter your username" maxlength="50">
+                        </div>
+                        <button class="btn btn-primary" id="joinBtn">
+                            <i class="fas fa-arrow-right"></i> Join Chat
+                        </button>
+                        <div class="login-help">
+                            <small>Username can contain letters, numbers, underscore, and dash only</small>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Chat Interface -->
+                <div class="chat-interface" id="chatInterface" style="display: none;">
+                    <!-- Chat Header -->
+                    <div class="chat-room-header">
+                        <div class="room-info">
+                            <h2 id="currentRoomName">General</h2>
+                            <div class="room-stats">
+                                <span id="roomUserCount">0 users</span>
+                            </div>
+                        </div>
+                        <div class="chat-actions">
+                            <button class="btn btn-sm" id="historyBtn" title="Message History">
+                                <i class="fas fa-history"></i>
+                            </button>
+                            <button class="btn btn-sm" id="searchBtn" title="Search Messages">
+                                <i class="fas fa-search"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Messages Area -->
+                    <div class="messages-container" id="messagesContainer">
+                        <div class="messages" id="messages">
+                            <!-- Messages will be populated here -->
+                        </div>
+                    </div>
+
+                    <!-- Message Input -->
+                    <div class="message-input-container">
+                        <div class="message-input">
+                            <input type="text" id="messageInput" placeholder="Type a message..." maxlength="500">
+                            <button class="btn btn-primary" id="sendBtn">
+                                <i class="fas fa-paper-plane"></i>
+                            </button>
+                        </div>
+                        <div class="input-help">
+                            <small>Use /help to see available commands</small>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <!-- Modals -->
+    <!-- Create Room Modal -->
+    <div class="modal" id="createRoomModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Create New Room</h3>
+                <button class="modal-close" id="closeCreateRoomModal">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="roomNameInput">Room Name:</label>
+                    <input type="text" id="roomNameInput" placeholder="Enter room name" maxlength="50">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="cancelCreateRoom">Cancel</button>
+                <button class="btn btn-primary" id="confirmCreateRoom">Create Room</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- History Modal -->
+    <div class="modal" id="historyModal">
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h3>Message History</h3>
+                <button class="modal-close" id="closeHistoryModal">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="history-controls">
+                    <button class="btn btn-sm" id="loadMoreHistory">Load More</button>
+                    <select id="historyLimit">
+                        <option value="10">10 messages</option>
+                        <option value="25" selected>25 messages</option>
+                        <option value="50">50 messages</option>
+                        <option value="100">100 messages</option>
+                    </select>
+                </div>
+                <div class="history-messages" id="historyMessages">
+                    <!-- History messages will be populated here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Search Modal -->
+    <div class="modal" id="searchModal">
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h3>Search Messages</h3>
+                <button class="modal-close" id="closeSearchModal">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="search-controls">
+                    <div class="form-group">
+                        <input type="text" id="searchInput" placeholder="Search messages...">
+                        <button class="btn btn-primary" id="performSearch">
+                            <i class="fas fa-search"></i> Search
+                        </button>
+                    </div>
+                </div>
+                <div class="search-results" id="searchResults">
+                    <!-- Search results will be populated here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notification Container -->
+    <div class="notifications" id="notifications">
+        <!-- Notifications will be populated here -->
+    </div>
+
+    <script src="chat.js"></script>
+</body>
+</html>

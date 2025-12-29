@@ -13,7 +13,7 @@ import (
 
 func main() {
 	// เชื่อมต่อไปยัง WebSocket server
-	serverURL := "ws://localhost:9090/ws"
+	serverURL := "ws://localhost:9091/ws"
 	fmt.Printf("🔄 กำลังเชื่อมต่อไปยัง %s...\n", serverURL)
 
 	conn, _, err := websocket.DefaultDialer.Dial(serverURL, nil)

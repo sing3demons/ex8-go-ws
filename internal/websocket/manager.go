@@ -8,6 +8,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"realtime-chat/internal/config"
+	messagePkg "realtime-chat/internal/message"
 )
 
 // Connection interface for WebSocket connections (to avoid import cycle)
@@ -153,6 +154,16 @@ func (m *Manager) BroadcastMessage(message interface{}, excludeID string) {
 	// Convert interface{} message to our internal Message type
 	if msg, ok := message.(*Message); ok {
 		m.BroadcastToRoom(msg, excludeID, "")
+	} else if msgPkg, ok := message.(*messagePkg.Message); ok {
+		// Convert from message.Message type
+		msg := &Message{
+			Type:      msgPkg.Type,
+			Content:   msgPkg.Content,
+			Sender:    msgPkg.Sender,
+			Username:  msgPkg.Username,
+			Timestamp: msgPkg.Timestamp,
+		}
+		m.BroadcastToRoom(msg, excludeID, "")
 	} else {
 		// Try to convert from chat.Message type
 		if chatMsg, ok := message.(MessageInterface); ok {
@@ -164,6 +175,8 @@ func (m *Manager) BroadcastMessage(message interface{}, excludeID string) {
 				Timestamp: chatMsg.GetTimestamp(),
 			}
 			m.BroadcastToRoom(msg, excludeID, "")
+		} else {
+			log.Printf("⚠️ Unknown message type in BroadcastMessage: %T", message)
 		}
 	}
 }
@@ -175,6 +188,15 @@ func (m *Manager) BroadcastToRoom(message interface{}, excludeID, roomName strin
 	// Convert interface{} message to our internal Message type
 	if m, ok := message.(*Message); ok {
 		msg = m
+	} else if msgPkg, ok := message.(*messagePkg.Message); ok {
+		// Convert from message.Message type
+		msg = &Message{
+			Type:      msgPkg.Type,
+			Content:   msgPkg.Content,
+			Sender:    msgPkg.Sender,
+			Username:  msgPkg.Username,
+			Timestamp: msgPkg.Timestamp,
+		}
 	} else {
 		// Try to convert from chat.Message type
 		if chatMsg, ok := message.(MessageInterface); ok {
@@ -186,7 +208,7 @@ func (m *Manager) BroadcastToRoom(message interface{}, excludeID, roomName strin
 				Timestamp: chatMsg.GetTimestamp(),
 			}
 		} else {
-			log.Println("⚠️ Unknown message type in BroadcastToRoom")
+			log.Printf("⚠️ Unknown message type in BroadcastToRoom: %T", message)
 			return
 		}
 	}

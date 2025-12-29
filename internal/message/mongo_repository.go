@@ -1,32 +1,32 @@
-package database
+package message
 
 import (
 	"context"
 	"fmt"
 	"time"
 
+	"realtime-chat/internal/database"
+
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
-
-	"realtime-chat/internal/chat"
 )
 
-// MongoMessageRepository implements message persistence using MongoDB
-type MongoMessageRepository struct {
+// MongoRepository implements Repository interface using MongoDB
+type MongoRepository struct {
 	collection *mongo.Collection
 }
 
-// NewMongoMessageRepository creates a new MongoDB message repository
-func NewMongoMessageRepository(db *MongoDB) *MongoMessageRepository {
-	return &MongoMessageRepository{
+// NewMongoRepository creates a new MongoDB message repository
+func NewMongoRepository(db *database.MongoDB) Repository {
+	return &MongoRepository{
 		collection: db.GetCollection("messages"),
 	}
 }
 
 // SaveMessage saves a message to MongoDB
-func (r *MongoMessageRepository) SaveMessage(message *chat.Message) error {
+func (r *MongoRepository) SaveMessage(message *Message) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -54,138 +54,60 @@ func (r *MongoMessageRepository) SaveMessage(message *chat.Message) error {
 	return nil
 }
 
-// GetMessageHistory retrieves message history for a room
-func (r *MongoMessageRepository) GetMessageHistory(roomName string, limit int) ([]*chat.Message, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// GetMessage retrieves a single message by ID
+func (r *MongoRepository) GetMessage(messageID string) (*Message, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Set default limit if not specified
-	if limit <= 0 {
-		limit = 50
-	}
-
-	// Find messages for the room, sorted by timestamp descending
-	opts := options.Find().
-		SetSort(bson.M{"timestamp": -1}).
-		SetLimit(int64(limit))
-
-	cursor, err := r.collection.Find(ctx, bson.M{"room_name": roomName}, opts)
+	objID, err := primitive.ObjectIDFromHex(messageID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve message history: %v", err)
+		return nil, fmt.Errorf("invalid message ID: %v", err)
 	}
-	defer cursor.Close(ctx)
 
-	var messages []*chat.Message
-	for cursor.Next(ctx) {
-		var messageDoc MessageDocument
-		if err := cursor.Decode(&messageDoc); err != nil {
-			continue
+	var messageDoc MessageDocument
+	err = r.collection.FindOne(ctx, bson.M{"_id": objID}).Decode(&messageDoc)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, fmt.Errorf("message not found")
 		}
-
-		message := &chat.Message{
-			ID:        messageDoc.ID.Hex(),
-			Type:      messageDoc.Type,
-			Content:   messageDoc.Content,
-			Username:  messageDoc.Username,
-			RoomName:  messageDoc.RoomName,
-			Timestamp: messageDoc.Timestamp,
-			Sender:    messageDoc.Sender,
-		}
-		messages = append(messages, message)
+		return nil, fmt.Errorf("failed to get message: %v", err)
 	}
 
-	// Reverse the slice to get chronological order (oldest first)
-	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
-		messages[i], messages[j] = messages[j], messages[i]
-	}
-
-	return messages, nil
+	return messageDoc.ToMessage(), nil
 }
 
-// GetRecentMessages retrieves recent messages across all rooms
-func (r *MongoMessageRepository) GetRecentMessages(limit int) ([]*chat.Message, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// UpdateMessage updates an existing message
+func (r *MongoRepository) UpdateMessage(message *Message) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if limit <= 0 {
-		limit = 100
-	}
-
-	opts := options.Find().
-		SetSort(bson.M{"timestamp": -1}).
-		SetLimit(int64(limit))
-
-	cursor, err := r.collection.Find(ctx, bson.M{}, opts)
+	objID, err := primitive.ObjectIDFromHex(message.ID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve recent messages: %v", err)
-	}
-	defer cursor.Close(ctx)
-
-	var messages []*chat.Message
-	for cursor.Next(ctx) {
-		var messageDoc MessageDocument
-		if err := cursor.Decode(&messageDoc); err != nil {
-			continue
-		}
-
-		message := &chat.Message{
-			ID:        messageDoc.ID.Hex(),
-			Type:      messageDoc.Type,
-			Content:   messageDoc.Content,
-			Username:  messageDoc.Username,
-			RoomName:  messageDoc.RoomName,
-			Timestamp: messageDoc.Timestamp,
-			Sender:    messageDoc.Sender,
-		}
-		messages = append(messages, message)
+		return fmt.Errorf("invalid message ID: %v", err)
 	}
 
-	return messages, nil
-}
-
-// GetUserMessageHistory retrieves message history for a specific user
-func (r *MongoMessageRepository) GetUserMessageHistory(username string, limit int) ([]*chat.Message, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if limit <= 0 {
-		limit = 50
+	update := bson.M{
+		"$set": bson.M{
+			"content":   message.Content,
+			"type":      message.Type,
+			"timestamp": message.Timestamp,
+		},
 	}
 
-	opts := options.Find().
-		SetSort(bson.M{"timestamp": -1}).
-		SetLimit(int64(limit))
-
-	cursor, err := r.collection.Find(ctx, bson.M{"username": username}, opts)
+	result, err := r.collection.UpdateOne(ctx, bson.M{"_id": objID}, update)
 	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve user message history: %v", err)
-	}
-	defer cursor.Close(ctx)
-
-	var messages []*chat.Message
-	for cursor.Next(ctx) {
-		var messageDoc MessageDocument
-		if err := cursor.Decode(&messageDoc); err != nil {
-			continue
-		}
-
-		message := &chat.Message{
-			ID:        messageDoc.ID.Hex(),
-			Type:      messageDoc.Type,
-			Content:   messageDoc.Content,
-			Username:  messageDoc.Username,
-			RoomName:  messageDoc.RoomName,
-			Timestamp: messageDoc.Timestamp,
-			Sender:    messageDoc.Sender,
-		}
-		messages = append(messages, message)
+		return fmt.Errorf("failed to update message: %v", err)
 	}
 
-	return messages, nil
+	if result.MatchedCount == 0 {
+		return fmt.Errorf("message not found")
+	}
+
+	return nil
 }
 
 // DeleteMessage deletes a message by ID
-func (r *MongoMessageRepository) DeleteMessage(messageID string) error {
+func (r *MongoRepository) DeleteMessage(messageID string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -206,8 +128,111 @@ func (r *MongoMessageRepository) DeleteMessage(messageID string) error {
 	return nil
 }
 
+// GetMessageHistory retrieves message history for a room
+func (r *MongoRepository) GetMessageHistory(roomName string, limit int) ([]*Message, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Set default limit if not specified
+	if limit <= 0 {
+		limit = 50
+	}
+
+	// Find messages for the room, sorted by timestamp descending
+	opts := options.Find().
+		SetSort(bson.M{"timestamp": -1}).
+		SetLimit(int64(limit))
+
+	cursor, err := r.collection.Find(ctx, bson.M{"room_name": roomName}, opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve message history: %v", err)
+	}
+	defer cursor.Close(ctx)
+
+	var messages []*Message
+	for cursor.Next(ctx) {
+		var messageDoc MessageDocument
+		if err := cursor.Decode(&messageDoc); err != nil {
+			continue
+		}
+
+		messages = append(messages, messageDoc.ToMessage())
+	}
+
+	// Reverse the slice to get chronological order (oldest first)
+	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
+		messages[i], messages[j] = messages[j], messages[i]
+	}
+
+	return messages, nil
+}
+
+// GetRecentMessages retrieves recent messages across all rooms
+func (r *MongoRepository) GetRecentMessages(limit int) ([]*Message, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if limit <= 0 {
+		limit = 100
+	}
+
+	opts := options.Find().
+		SetSort(bson.M{"timestamp": -1}).
+		SetLimit(int64(limit))
+
+	cursor, err := r.collection.Find(ctx, bson.M{}, opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve recent messages: %v", err)
+	}
+	defer cursor.Close(ctx)
+
+	var messages []*Message
+	for cursor.Next(ctx) {
+		var messageDoc MessageDocument
+		if err := cursor.Decode(&messageDoc); err != nil {
+			continue
+		}
+
+		messages = append(messages, messageDoc.ToMessage())
+	}
+
+	return messages, nil
+}
+
+// GetUserMessageHistory retrieves message history for a specific user
+func (r *MongoRepository) GetUserMessageHistory(username string, limit int) ([]*Message, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if limit <= 0 {
+		limit = 50
+	}
+
+	opts := options.Find().
+		SetSort(bson.M{"timestamp": -1}).
+		SetLimit(int64(limit))
+
+	cursor, err := r.collection.Find(ctx, bson.M{"username": username}, opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve user message history: %v", err)
+	}
+	defer cursor.Close(ctx)
+
+	var messages []*Message
+	for cursor.Next(ctx) {
+		var messageDoc MessageDocument
+		if err := cursor.Decode(&messageDoc); err != nil {
+			continue
+		}
+
+		messages = append(messages, messageDoc.ToMessage())
+	}
+
+	return messages, nil
+}
+
 // GetMessageCount returns the total number of messages in a room
-func (r *MongoMessageRepository) GetMessageCount(roomName string) (int64, error) {
+func (r *MongoRepository) GetMessageCount(roomName string) (int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -225,7 +250,7 @@ func (r *MongoMessageRepository) GetMessageCount(roomName string) (int64, error)
 }
 
 // SearchMessages searches for messages containing specific text
-func (r *MongoMessageRepository) SearchMessages(query string, roomName string, limit int) ([]*chat.Message, error) {
+func (r *MongoRepository) SearchMessages(query string, roomName string, limit int) ([]*Message, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -252,23 +277,14 @@ func (r *MongoMessageRepository) SearchMessages(query string, roomName string, l
 	}
 	defer cursor.Close(ctx)
 
-	var messages []*chat.Message
+	var messages []*Message
 	for cursor.Next(ctx) {
 		var messageDoc MessageDocument
 		if err := cursor.Decode(&messageDoc); err != nil {
 			continue
 		}
 
-		message := &chat.Message{
-			ID:        messageDoc.ID.Hex(),
-			Type:      messageDoc.Type,
-			Content:   messageDoc.Content,
-			Username:  messageDoc.Username,
-			RoomName:  messageDoc.RoomName,
-			Timestamp: messageDoc.Timestamp,
-			Sender:    messageDoc.Sender,
-		}
-		messages = append(messages, message)
+		messages = append(messages, messageDoc.ToMessage())
 	}
 
 	return messages, nil

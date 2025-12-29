@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -9,7 +10,9 @@ import (
 
 	"github.com/gorilla/websocket"
 	"realtime-chat/internal/config"
+	messagePkg "realtime-chat/internal/message"
 	"realtime-chat/internal/security"
+	userPkg "realtime-chat/internal/user"
 	wsocket "realtime-chat/internal/websocket"
 )
 
@@ -27,14 +30,29 @@ type Handler struct {
 	messageRepo    MessageRepository // Add message repository
 }
 
-// WebSocketManager interface for WebSocket connection management
-type WebSocketManager interface {
-	AddConnection(conn *websocket.Conn) string
-	RemoveConnection(connID string)
-	GetConnection(connID string) (Connection, bool)
-	BroadcastMessage(message interface{}, excludeID string)
-	BroadcastToRoom(message interface{}, excludeID, roomName string)
-	GetConnectionHealth(connID string) (*config.ConnectionHealth, bool)
+// ClientMessage represents incoming messages from client
+type ClientMessage struct {
+	Type     string `json:"type"`
+	Content  string `json:"content,omitempty"`
+	Username string `json:"username,omitempty"`
+	Room     string `json:"room,omitempty"`
+	Command  string `json:"command,omitempty"`
+	Query    string `json:"query,omitempty"`
+	Limit    int    `json:"limit,omitempty"`
+}
+
+// ServerMessage represents outgoing messages to client
+type ServerMessage struct {
+	Type      string                `json:"type"`
+	Content   string                `json:"content,omitempty"`
+	Sender    string                `json:"sender,omitempty"`
+	Username  string                `json:"username,omitempty"`
+	Room      string                `json:"room,omitempty"`
+	Timestamp time.Time             `json:"timestamp"`
+	Users     []string              `json:"users,omitempty"`
+	Rooms     []string              `json:"rooms,omitempty"`
+	Messages  []*messagePkg.Message   `json:"messages,omitempty"`
+	Message   string                `json:"message,omitempty"`
 }
 
 // NewHandler creates a new HTTP handler
@@ -124,23 +142,49 @@ func (h *Handler) handleRead(conn *websocket.Conn, connID, clientAddr string) {
 			break
 		}
 
+		// Try to parse as JSON first
+		var clientMsg ClientMessage
+		var isJSON bool
+		if err := json.Unmarshal(rawMessage, &clientMsg); err == nil && clientMsg.Type != "" {
+			isJSON = true
+		} else {
+			// Fallback to plain text for backward compatibility
+			clientMsg = ClientMessage{
+				Type:    "message",
+				Content: messageContent,
+			}
+		}
+
 		// ตรวจสอบว่า user authenticated หรือยัง
 		user := connection.GetUser()
 		if user == nil {
-			// ยังไม่ authenticated - ใช้ข้อความเป็น username
-			username := strings.TrimSpace(messageContent)
+			// Handle authentication
+			var username string
+			if isJSON && clientMsg.Type == "join" && clientMsg.Username != "" {
+				username = clientMsg.Username
+			} else {
+				username = strings.TrimSpace(messageContent)
+			}
 			
 			// Validate username
 			validatedUsername, err := h.validator.ValidateUsername(username)
 			if err != nil {
-				h.sendErrorMessage(connection, fmt.Sprintf("❌ %s", err.Error()))
+				h.sendJSONMessage(connection, ServerMessage{
+					Type:      "error",
+					Message:   err.Error(),
+					Timestamp: time.Now(),
+				})
 				continue
 			}
 
 			// ลองลงทะเบียน user
 			newUser, err := h.userService.RegisterUser(connID, validatedUsername)
 			if err != nil {
-				h.sendErrorMessage(connection, fmt.Sprintf("❌ %s กรุณาเลือกชื่อผู้ใช้อื่น:", err.Error()))
+				h.sendJSONMessage(connection, ServerMessage{
+					Type:      "error",
+					Message:   fmt.Sprintf("Username already taken: %s", err.Error()),
+					Timestamp: time.Now(),
+				})
 				continue
 			}
 
@@ -154,90 +198,75 @@ func (h *Handler) handleRead(conn *websocket.Conn, connID, clientAddr string) {
 			}
 
 			// ส่งข้อความต้อนรับ
-			welcomeMsg := fmt.Sprintf("🎉 ยินดีต้อนรับ %s! คุณอยู่ในห้อง 'general' แล้ว", validatedUsername)
-			h.sendSystemMessage(connection, welcomeMsg)
+			h.sendJSONMessage(connection, ServerMessage{
+				Type:      "system",
+				Message:   fmt.Sprintf("Welcome %s! You joined room 'general'", validatedUsername),
+				Timestamp: time.Now(),
+			})
+
+			// Send initial room and user lists
+			h.sendRoomsList(connection)
+			h.sendUsersList(connection, "general")
 
 			// แจ้งให้คนในห้องเดียวกันรู้ว่ามีคนเข้ามา
-			joinMsg := &Message{
+			joinMsg := &messagePkg.Message{
 				Type:      "user_joined",
-				Content:   fmt.Sprintf("👋 %s เข้าร่วมห้อง 'general' แล้ว", validatedUsername),
+				Content:   fmt.Sprintf("%s joined room 'general'", validatedUsername),
 				Sender:    "System",
 				Username:  "System",
+				RoomName:  "general",
 				Timestamp: time.Now(),
 			}
 			h.wsManager.BroadcastToRoom(joinMsg, connID, "general")
 
 		} else {
-			// User authenticated แล้ว - ประมวลผลข้อความปกติ
-			if chatUser, ok := user.(*User); ok && chatUser.IsAuthenticated {
+			// User authenticated แล้ว - ประมวลผลข้อความ
+			if chatUser, ok := user.(*userPkg.User); ok && chatUser.IsAuthenticated {
 				h.userService.UpdateLastActive(connID)
 
 				// Check rate limit
 				if !h.rateLimiter.CheckRateLimit(chatUser.ID) {
 					remaining, _, timeRemaining := h.rateLimiter.GetRateLimitStatus(chatUser.ID)
-					h.sendErrorMessage(connection, fmt.Sprintf("⚠️ Rate limit exceeded! You can send %d more messages in %v", remaining, timeRemaining.Round(time.Second)))
+					h.sendJSONMessage(connection, ServerMessage{
+						Type:      "error",
+						Message:   fmt.Sprintf("Rate limit exceeded! You can send %d more messages in %v", remaining, timeRemaining.Round(time.Second)),
+						Timestamp: time.Now(),
+					})
 					continue
 				}
 
-				// ตรวจสอบว่าเป็นคำสั่งหรือไม่
-				if strings.HasPrefix(messageContent, "/") {
-					// Validate command
-					validatedCommand, err := h.validator.ValidateCommand(messageContent)
-					if err != nil {
-						h.sendErrorMessage(connection, fmt.Sprintf("❌ Invalid command: %s", err.Error()))
-						continue
-					}
-
-					// ประมวลผลคำสั่ง
-					err = h.commandService.ExecuteCommand(connection, validatedCommand)
-					if err != nil {
-						if err.Error() == "not a command" {
-							// ไม่ใช่คำสั่ง ประมวลผลเป็นข้อความธรรมดา
-						} else if strings.HasPrefix(err.Error(), "unknown command:") {
-							h.sendErrorMessage(connection, fmt.Sprintf("❌ %s ใช้ /help เพื่อดูคำสั่งที่ใช้ได้", err.Error()))
-							continue
+				// Handle different message types
+				switch clientMsg.Type {
+				case "message":
+					h.handleChatMessage(connection, chatUser, clientMsg)
+				case "command":
+					h.handleCommand(connection, chatUser, clientMsg)
+				case "join_room":
+					h.handleJoinRoom(connection, chatUser, clientMsg)
+				case "leave_room":
+					h.handleLeaveRoom(connection, chatUser, clientMsg)
+				case "create_room":
+					h.handleCreateRoom(connection, chatUser, clientMsg)
+				case "get_history":
+					h.handleGetHistory(connection, chatUser, clientMsg)
+				case "get_my_history":
+					h.handleGetMyHistory(connection, chatUser, clientMsg)
+				case "search_messages":
+					h.handleSearchMessages(connection, chatUser, clientMsg)
+				default:
+					// Fallback to plain text message handling
+					if clientMsg.Content != "" {
+						if strings.HasPrefix(clientMsg.Content, "/") {
+							// Handle as command
+							clientMsg.Type = "command"
+							clientMsg.Command = clientMsg.Content
+							h.handleCommand(connection, chatUser, clientMsg)
 						} else {
-							h.sendErrorMessage(connection, fmt.Sprintf("❌ เกิดข้อผิดพลาด: %s", err.Error()))
-							continue
+							// Handle as regular message
+							h.handleChatMessage(connection, chatUser, clientMsg)
 						}
-					} else {
-						// คำสั่งทำงานสำเร็จ
-						continue
 					}
 				}
-
-				// ตรวจสอบว่าผู้ใช้อยู่ในห้องหรือไม่
-				if chatUser.CurrentRoom == "" {
-					h.sendErrorMessage(connection, "❌ คุณต้องอยู่ในห้องก่อนจึงจะส่งข้อความได้ ใช้ /join <room> เพื่อเข้าห้อง")
-					continue
-				}
-
-				// Validate message content
-				validatedMessage, err := h.validator.ValidateMessage(messageContent)
-				if err != nil {
-					h.sendErrorMessage(connection, fmt.Sprintf("❌ %s", err.Error()))
-					continue
-				}
-
-				// สร้าง message object พร้อม username
-				message := &Message{
-					Type:      "text",
-					Content:   validatedMessage,
-					Sender:    clientAddr,
-					Username:  chatUser.Username,
-					RoomName:  chatUser.CurrentRoom,
-					Timestamp: time.Now(),
-				}
-
-				// Save message to database if MongoDB is enabled
-				if h.messageRepo != nil {
-					if err := h.messageRepo.SaveMessage(message); err != nil {
-						log.Printf("⚠️ Failed to save message to database: %v", err)
-					}
-				}
-
-				// Broadcast ข้อความไปยัง clients ในห้องเดียวกัน (ไม่รวมผู้ส่ง)
-				h.wsManager.BroadcastToRoom(message, connID, chatUser.CurrentRoom)
 			}
 		}
 	}
@@ -330,4 +359,356 @@ func (h *Handler) sendErrorMessage(conn Connection, message string) {
 	if err != nil {
 		log.Printf("❌ Failed to send error message to %s", conn.GetID())
 	}
+}
+
+// sendJSONMessage sends a JSON message to a specific connection
+func (h *Handler) sendJSONMessage(conn Connection, message ServerMessage) {
+	data, err := json.Marshal(message)
+	if err != nil {
+		log.Printf("❌ Failed to marshal JSON message: %v", err)
+		return
+	}
+	
+	err = conn.SendMessage(data)
+	if err != nil {
+		log.Printf("❌ Failed to send JSON message to %s: %v", conn.GetID(), err)
+	}
+}
+
+// broadcastJSONToRoom broadcasts a JSON message to all connections in a room
+func (h *Handler) broadcastJSONToRoom(message ServerMessage, excludeID, roomName string) {
+	data, err := json.Marshal(message)
+	if err != nil {
+		log.Printf("❌ Failed to marshal JSON broadcast message: %v", err)
+		return
+	}
+	
+	h.wsManager.BroadcastToRoom(data, excludeID, roomName)
+}
+
+// handleChatMessage handles regular chat messages
+func (h *Handler) handleChatMessage(conn Connection, user *userPkg.User, msg ClientMessage) {
+	// ตรวจสอบว่าผู้ใช้อยู่ในห้องหรือไม่
+	if user.CurrentRoom == "" {
+		h.sendJSONMessage(conn, ServerMessage{
+			Type:      "error",
+			Message:   "You must be in a room to send messages. Use /join <room> to join a room",
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	// Validate message content
+	validatedMessage, err := h.validator.ValidateMessage(msg.Content)
+	if err != nil {
+		h.sendJSONMessage(conn, ServerMessage{
+			Type:      "error",
+			Message:   err.Error(),
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	// สร้าง message object
+	message := &messagePkg.Message{
+		Type:      "message",
+		Content:   validatedMessage,
+		Sender:    conn.GetID(),
+		Username:  user.Username,
+		RoomName:  user.CurrentRoom,
+		Timestamp: time.Now(),
+	}
+
+	// Save message to database if MongoDB is enabled
+	if h.messageRepo != nil {
+		if err := h.messageRepo.SaveMessage(message); err != nil {
+			log.Printf("⚠️ Failed to save message to database: %v", err)
+		}
+	}
+
+	// Create server message for broadcast
+	serverMsg := &messagePkg.Message{
+		Type:      "message",
+		Content:   validatedMessage,
+		Sender:    conn.GetID(),
+		Username:  user.Username,
+		RoomName:  user.CurrentRoom,
+		Timestamp: time.Now(),
+	}
+
+	// Broadcast to room (excluding sender)
+	h.wsManager.BroadcastToRoom(serverMsg, conn.GetID(), user.CurrentRoom)
+}
+
+// handleCommand handles command messages
+func (h *Handler) handleCommand(conn Connection, user *userPkg.User, msg ClientMessage) {
+	var command string
+	if msg.Command != "" {
+		command = msg.Command
+	} else {
+		command = msg.Content
+	}
+
+	// Validate command
+	validatedCommand, err := h.validator.ValidateCommand(command)
+	if err != nil {
+		h.sendJSONMessage(conn, ServerMessage{
+			Type:      "error",
+			Message:   fmt.Sprintf("Invalid command: %s", err.Error()),
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	// Execute command
+	err = h.commandService.ExecuteCommand(conn, validatedCommand)
+	if err != nil {
+		if err.Error() == "not a command" {
+			// Handle as regular message
+			msg.Type = "message"
+			h.handleChatMessage(conn, user, msg)
+		} else if strings.HasPrefix(err.Error(), "unknown command:") {
+			h.sendJSONMessage(conn, ServerMessage{
+				Type:      "error",
+				Message:   fmt.Sprintf("%s Use /help to see available commands", err.Error()),
+				Timestamp: time.Now(),
+			})
+		} else {
+			h.sendJSONMessage(conn, ServerMessage{
+				Type:      "error",
+				Message:   fmt.Sprintf("Command error: %s", err.Error()),
+				Timestamp: time.Now(),
+			})
+		}
+	}
+}
+
+// handleJoinRoom handles room joining
+func (h *Handler) handleJoinRoom(conn Connection, user *userPkg.User, msg ClientMessage) {
+	if msg.Room == "" {
+		h.sendJSONMessage(conn, ServerMessage{
+			Type:      "error",
+			Message:   "Room name is required",
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	// Leave current room if in one
+	if user.CurrentRoom != "" {
+		h.roomService.LeaveRoom(user, user.CurrentRoom)
+	}
+
+	// Join new room
+	err := h.roomService.JoinRoom(user, msg.Room)
+	if err != nil {
+		h.sendJSONMessage(conn, ServerMessage{
+			Type:      "error",
+			Message:   fmt.Sprintf("Failed to join room: %s", err.Error()),
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	// Send confirmation
+	h.sendJSONMessage(conn, ServerMessage{
+		Type:      "room_joined",
+		Room:      msg.Room,
+		Timestamp: time.Now(),
+	})
+
+	// Update room and user lists
+	h.sendRoomsList(conn)
+	h.sendUsersList(conn, msg.Room)
+}
+
+// handleLeaveRoom handles room leaving
+func (h *Handler) handleLeaveRoom(conn Connection, user *userPkg.User, msg ClientMessage) {
+	if user.CurrentRoom == "" {
+		h.sendJSONMessage(conn, ServerMessage{
+			Type:      "error",
+			Message:   "You are not in any room",
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	roomName := user.CurrentRoom
+	err := h.roomService.LeaveRoom(user, roomName)
+	if err != nil {
+		h.sendJSONMessage(conn, ServerMessage{
+			Type:      "error",
+			Message:   fmt.Sprintf("Failed to leave room: %s", err.Error()),
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	h.sendJSONMessage(conn, ServerMessage{
+		Type:      "room_left",
+		Room:      roomName,
+		Timestamp: time.Now(),
+	})
+}
+
+// handleCreateRoom handles room creation
+func (h *Handler) handleCreateRoom(conn Connection, user *userPkg.User, msg ClientMessage) {
+	if msg.Room == "" {
+		h.sendJSONMessage(conn, ServerMessage{
+			Type:      "error",
+			Message:   "Room name is required",
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	// Create room (this would need to be implemented in room service)
+	// For now, just send success message
+	h.sendJSONMessage(conn, ServerMessage{
+		Type:      "room_created",
+		Room:      msg.Room,
+		Timestamp: time.Now(),
+	})
+
+	// Update room list
+	h.sendRoomsList(conn)
+}
+
+// handleGetHistory handles message history requests
+func (h *Handler) handleGetHistory(conn Connection, user *userPkg.User, msg ClientMessage) {
+	if h.messageRepo == nil {
+		h.sendJSONMessage(conn, ServerMessage{
+			Type:      "error",
+			Message:   "Message history not available",
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	limit := msg.Limit
+	if limit <= 0 {
+		limit = 25
+	}
+
+	roomName := msg.Room
+	if roomName == "" {
+		roomName = user.CurrentRoom
+	}
+
+	messages, err := h.messageRepo.GetMessageHistory(roomName, limit)
+	if err != nil {
+		h.sendJSONMessage(conn, ServerMessage{
+			Type:      "error",
+			Message:   fmt.Sprintf("Failed to get history: %s", err.Error()),
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	h.sendJSONMessage(conn, ServerMessage{
+		Type:      "history",
+		Messages:  messages,
+		Timestamp: time.Now(),
+	})
+}
+
+// handleGetMyHistory handles user's message history requests
+func (h *Handler) handleGetMyHistory(conn Connection, user *userPkg.User, msg ClientMessage) {
+	if h.messageRepo == nil {
+		h.sendJSONMessage(conn, ServerMessage{
+			Type:      "error",
+			Message:   "Message history not available",
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	limit := msg.Limit
+	if limit <= 0 {
+		limit = 25
+	}
+
+	messages, err := h.messageRepo.GetUserMessageHistory(user.Username, limit)
+	if err != nil {
+		h.sendJSONMessage(conn, ServerMessage{
+			Type:      "error",
+			Message:   fmt.Sprintf("Failed to get your history: %s", err.Error()),
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	h.sendJSONMessage(conn, ServerMessage{
+		Type:      "history",
+		Messages:  messages,
+		Timestamp: time.Now(),
+	})
+}
+
+// handleSearchMessages handles message search requests
+func (h *Handler) handleSearchMessages(conn Connection, user *userPkg.User, msg ClientMessage) {
+	if h.messageRepo == nil {
+		h.sendJSONMessage(conn, ServerMessage{
+			Type:      "error",
+			Message:   "Message search not available",
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	if msg.Query == "" {
+		h.sendJSONMessage(conn, ServerMessage{
+			Type:      "error",
+			Message:   "Search query is required",
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	roomName := msg.Room
+	if roomName == "" {
+		roomName = user.CurrentRoom
+	}
+
+	messages, err := h.messageRepo.SearchMessages(msg.Query, roomName, 50)
+	if err != nil {
+		h.sendJSONMessage(conn, ServerMessage{
+			Type:      "error",
+			Message:   fmt.Sprintf("Search failed: %s", err.Error()),
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	h.sendJSONMessage(conn, ServerMessage{
+		Type:      "search_results",
+		Messages:  messages,
+		Timestamp: time.Now(),
+	})
+}
+
+// sendRoomsList sends the list of available rooms
+func (h *Handler) sendRoomsList(conn Connection) {
+	// This would need to be implemented to get actual room list
+	// For now, send a basic list
+	rooms := []string{"general"} // This should come from room service
+	
+	h.sendJSONMessage(conn, ServerMessage{
+		Type:      "rooms_list",
+		Rooms:     rooms,
+		Timestamp: time.Now(),
+	})
+}
+
+// sendUsersList sends the list of users in a room
+func (h *Handler) sendUsersList(conn Connection, roomName string) {
+	// This would need to be implemented to get actual user list
+	// For now, send empty list
+	users := []string{} // This should come from room service
+	
+	h.sendJSONMessage(conn, ServerMessage{
+		Type:      "users_list",
+		Users:     users,
+		Timestamp: time.Now(),
+	})
 }

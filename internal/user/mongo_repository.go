@@ -1,32 +1,75 @@
-package database
+package user
 
 import (
 	"context"
 	"fmt"
+	"realtime-chat/internal/database"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
-
-	"realtime-chat/internal/chat"
 )
 
-// MongoUserRepository implements chat.UserRepository using MongoDB
-type MongoUserRepository struct {
+// UserDocument represents a user document in MongoDB
+type UserDocument struct {
+	ID              primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Username        string             `bson:"username" json:"username"`
+	ConnID          string             `bson:"conn_id" json:"conn_id"`
+	CurrentRoom     string             `bson:"current_room" json:"current_room"`
+	JoinedAt        time.Time          `bson:"joined_at" json:"joined_at"`
+	LastActive      time.Time          `bson:"last_active" json:"last_active"`
+	IsAuthenticated bool               `bson:"is_authenticated" json:"is_authenticated"`
+	CreatedAt       time.Time          `bson:"created_at" json:"created_at"`
+	UpdatedAt       time.Time          `bson:"updated_at" json:"updated_at"`
+}
+
+// ToUser converts UserDocument to User entity
+func (doc *UserDocument) ToUser() *User {
+	return &User{
+		ID:              doc.ID.Hex(),
+		Username:        doc.Username,
+		ConnID:          doc.ConnID,
+		CurrentRoom:     doc.CurrentRoom,
+		JoinedAt:        doc.JoinedAt,
+		LastActive:      doc.LastActive,
+		IsAuthenticated: doc.IsAuthenticated,
+	}
+}
+
+// FromUser converts User entity to UserDocument
+func (doc *UserDocument) FromUser(user *User) {
+	doc.Username = user.Username
+	doc.ConnID = user.ConnID
+	doc.CurrentRoom = user.CurrentRoom
+	doc.JoinedAt = user.JoinedAt
+	doc.LastActive = user.LastActive
+	doc.IsAuthenticated = user.IsAuthenticated
+	doc.CreatedAt = time.Now()
+	doc.UpdatedAt = time.Now()
+
+	if user.ID != "" {
+		if oid, err := primitive.ObjectIDFromHex(user.ID); err == nil {
+			doc.ID = oid
+		}
+	}
+}
+
+// MongoRepository implements Repository using MongoDB
+type MongoRepository struct {
 	collection *mongo.Collection
 }
 
-// NewMongoUserRepository creates a new MongoDB user repository
-func NewMongoUserRepository(db *MongoDB) *MongoUserRepository {
-	return &MongoUserRepository{
+// NewMongoRepository creates a new MongoDB user repository
+func NewMongoRepository(db *database.MongoDB) Repository {
+	return &MongoRepository{
 		collection: db.GetCollection("users"),
 	}
 }
 
 // Create creates a new user
-func (r *MongoUserRepository) Create(connID, username string) (*chat.User, error) {
+func (r *MongoRepository) Create(connID, username string) (*User, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -52,8 +95,8 @@ func (r *MongoUserRepository) Create(connID, username string) (*chat.User, error
 		return nil, fmt.Errorf("failed to create user: %v", err)
 	}
 
-	// Convert to chat.User
-	user := &chat.User{
+	// Convert to user.User
+	user := &User{
 		ID:              result.InsertedID.(primitive.ObjectID).Hex(),
 		Username:        username,
 		ConnID:          connID,
@@ -67,7 +110,7 @@ func (r *MongoUserRepository) Create(connID, username string) (*chat.User, error
 }
 
 // GetByID gets a user by connection ID
-func (r *MongoUserRepository) GetByID(connID string) (*chat.User, bool) {
+func (r *MongoRepository) GetByID(connID string) (*User, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -80,7 +123,7 @@ func (r *MongoUserRepository) GetByID(connID string) (*chat.User, bool) {
 		return nil, false
 	}
 
-	user := &chat.User{
+	user := &User{
 		ID:              userDoc.ID.Hex(),
 		Username:        userDoc.Username,
 		ConnID:          userDoc.ConnID,
@@ -94,7 +137,7 @@ func (r *MongoUserRepository) GetByID(connID string) (*chat.User, bool) {
 }
 
 // GetByUsername gets a user by username
-func (r *MongoUserRepository) GetByUsername(username string) (*chat.User, bool) {
+func (r *MongoRepository) GetByUsername(username string) (*User, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -107,7 +150,7 @@ func (r *MongoUserRepository) GetByUsername(username string) (*chat.User, bool) 
 		return nil, false
 	}
 
-	user := &chat.User{
+	user := &User{
 		ID:              userDoc.ID.Hex(),
 		Username:        userDoc.Username,
 		ConnID:          userDoc.ConnID,
@@ -121,7 +164,7 @@ func (r *MongoUserRepository) GetByUsername(username string) (*chat.User, bool) 
 }
 
 // IsUsernameAvailable checks if a username is available
-func (r *MongoUserRepository) IsUsernameAvailable(username string) bool {
+func (r *MongoRepository) IsUsernameAvailable(username string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -134,24 +177,24 @@ func (r *MongoUserRepository) IsUsernameAvailable(username string) bool {
 }
 
 // GetAll returns all users
-func (r *MongoUserRepository) GetAll() []*chat.User {
+func (r *MongoRepository) GetAll() []*User {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	cursor, err := r.collection.Find(ctx, bson.M{})
 	if err != nil {
-		return []*chat.User{}
+		return []*User{}
 	}
 	defer cursor.Close(ctx)
 
-	var users []*chat.User
+	var users []*User
 	for cursor.Next(ctx) {
 		var userDoc UserDocument
 		if err := cursor.Decode(&userDoc); err != nil {
 			continue
 		}
 
-		user := &chat.User{
+		user := &User{
 			ID:              userDoc.ID.Hex(),
 			Username:        userDoc.Username,
 			ConnID:          userDoc.ConnID,
@@ -167,7 +210,7 @@ func (r *MongoUserRepository) GetAll() []*chat.User {
 }
 
 // UpdateLastActive updates user's last active time
-func (r *MongoUserRepository) UpdateLastActive(connID string) {
+func (r *MongoRepository) UpdateLastActive(connID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -182,7 +225,7 @@ func (r *MongoUserRepository) UpdateLastActive(connID string) {
 }
 
 // UpdateCurrentRoom updates user's current room
-func (r *MongoUserRepository) UpdateCurrentRoom(connID, roomName string) error {
+func (r *MongoRepository) UpdateCurrentRoom(connID, roomName string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -206,7 +249,7 @@ func (r *MongoUserRepository) UpdateCurrentRoom(connID, roomName string) error {
 }
 
 // Delete removes a user
-func (r *MongoUserRepository) Delete(connID string) error {
+func (r *MongoRepository) Delete(connID string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -223,30 +266,30 @@ func (r *MongoUserRepository) Delete(connID string) error {
 }
 
 // GetActiveUsers returns users active within the specified duration
-func (r *MongoUserRepository) GetActiveUsers(since time.Duration) []*chat.User {
+func (r *MongoRepository) GetActiveUsers(since time.Duration) []*User {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	cutoff := time.Now().Add(-since)
 	filter := bson.M{
-		"last_active": bson.M{"$gte": cutoff},
+		"last_active":      bson.M{"$gte": cutoff},
 		"is_authenticated": true,
 	}
 
 	cursor, err := r.collection.Find(ctx, filter, options.Find().SetSort(bson.M{"last_active": -1}))
 	if err != nil {
-		return []*chat.User{}
+		return []*User{}
 	}
 	defer cursor.Close(ctx)
 
-	var users []*chat.User
+	var users []*User
 	for cursor.Next(ctx) {
 		var userDoc UserDocument
 		if err := cursor.Decode(&userDoc); err != nil {
 			continue
 		}
 
-		user := &chat.User{
+		user := &User{
 			ID:              userDoc.ID.Hex(),
 			Username:        userDoc.Username,
 			ConnID:          userDoc.ConnID,
